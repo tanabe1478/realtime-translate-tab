@@ -1,0 +1,23 @@
+{
+  "name": "realtime-translate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reliable browser-based realtime transcription and translation",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "dev": "pnpm --filter @realtime-translate/contracts build && concurrently -n server,web -c green,cyan \"pnpm --filter @realtime-translate/server dev\" \"pnpm --filter @realtime-translate/web dev\"",
+    "dev:local": "pnpm --filter @realtime-translate/contracts build && concurrently -k -n whisper,server,web -c yellow,green,cyan \"pnpm whisper:start\" \"pnpm --filter @realtime-translate/server dev\" \"pnpm --filter @realtime-translate/web dev\"",
+    "whisper:setup": "node scripts/whisper.mjs setup",
+    "whisper:start": "node scripts/whisper.mjs start",
+    "auth:openai": "pnpm --filter @realtime-translate/server auth:openai",
+    "auth:openai:logout": "pnpm --filter @realtime-translate/server auth:openai:logout",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm --filter @realtime-translate/contracts build && pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "start": "pnpm --filter @realtime-translate/server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,19 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.env
+.venv-whisper/
+.DS_Store
+.vite/
+data/*.sqlite
+data/*.sqlite-*
+data/auth.json
+data/auth.json.lock
+data/device-id
+data/audio/*
+!data/audio/.gitkeep
+
+# Local reference repository; not part of this application.
+live-lecture-translation/

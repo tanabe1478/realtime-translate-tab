@@ -1,0 +1,27 @@
+{
+  "name": "@realtime-translate/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/index.js",
+    "auth:openai": "tsx src/openai-login.ts",
+    "auth:openai:logout": "tsx src/openai-logout.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^1.0.4",
+    "@realtime-translate/contracts": "workspace:*",
+    "dotenv": "^17.2.3",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "vitest": "^3.2.4"
+  }
+}
