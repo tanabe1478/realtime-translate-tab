@@ -18,6 +18,7 @@ describe("LocalWhisperRecognizer", () => {
       request.on("data", (chunk: Buffer) => { receivedBytes += chunk.byteLength; });
       request.on("end", () => {
         expect(request.headers["x-source-language"]).toBe("en-US");
+        expect(decodeURIComponent(String(request.headers["x-initial-prompt"]))).toBe("previous terminology");
         response.writeHead(200, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ text: "hello world", language: "en" }));
       });
@@ -34,6 +35,7 @@ describe("LocalWhisperRecognizer", () => {
       mimeType: "audio/wav",
       fileName: "audio.wav",
       sourceLanguage: "en-US",
+      prompt: "previous terminology",
     }, AbortSignal.timeout(1_000));
 
     expect(receivedBytes).toBe(3);

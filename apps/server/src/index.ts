@@ -150,6 +150,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       return;
     }
     events.publish({ type: "session.status", sessionId: session.id, status: session.status });
+    pipeline.flushSession(session.id);
     if (database.completeSessionIfDrained(session.id)) {
       events.publish({ type: "session.status", sessionId: session.id, status: "completed" });
     }

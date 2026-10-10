@@ -24,6 +24,7 @@ export class LocalWhisperRecognizer implements SpeechRecognizer {
         "Content-Type": input.mimeType,
         "X-File-Name": encodeURIComponent(input.fileName),
         ...(input.sourceLanguage && input.sourceLanguage !== "auto" ? { "X-Source-Language": input.sourceLanguage } : {}),
+        ...(input.prompt ? { "X-Initial-Prompt": encodeURIComponent(input.prompt.slice(-1_000)) } : {}),
       },
       body: new Uint8Array(input.bytes),
       signal,

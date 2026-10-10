@@ -26,12 +26,25 @@ export interface SessionView {
 export interface UtteranceView {
   id: string;
   sessionId: string;
+  /** Sequence number of the last audio chunk included in this utterance. */
   seq: number;
+  startSeq: number;
+  endSeq: number;
   text: string;
   language: string | null;
   startedAtMs: number;
   endedAtMs: number;
   createdAt: string;
+}
+
+export interface PartialUtteranceView {
+  sessionId: string;
+  startSeq: number;
+  endSeq: number;
+  text: string;
+  language: string | null;
+  startedAtMs: number;
+  endedAtMs: number;
 }
 
 export interface TranslationView {
@@ -81,6 +94,7 @@ export type ServerEvent =
   | { type: "audio.ack"; sessionId: string; seq: number }
   | { type: "audio.rejected"; sessionId: string; seq: number; message: string; retryable: boolean }
   | { type: "asr.started"; sessionId: string; seq: number }
+  | { type: "utterance.partial"; sessionId: string; seq: number; utterance: PartialUtteranceView }
   | { type: "utterance.final"; sessionId: string; seq: number; utterance: UtteranceView }
   | { type: "translation.final"; sessionId: string; seq: number; translation: TranslationView }
   | { type: "processing.skipped"; sessionId: string; seq: number; stage: "asr" | "translation"; reason: string }

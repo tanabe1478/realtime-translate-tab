@@ -3,6 +3,8 @@ export interface AudioInput {
   mimeType: string;
   fileName: string;
   sourceLanguage: string | null;
+  /** Recent finalized source text used only to keep ASR terminology consistent. */
+  prompt?: string;
 }
 
 export interface TranscriptionResult {
@@ -17,11 +19,18 @@ export interface SpeechRecognizer {
   checkHealth(signal: AbortSignal): Promise<boolean>;
 }
 
+export interface TranslationContextEntry {
+  sourceText: string;
+  translatedText: string | null;
+}
+
 export interface TranslationInput {
   sessionId: string;
   text: string;
   sourceLanguage: string | null;
   targetLanguage: string;
+  /** Finalized preceding utterances. They are reference context, not translation input. */
+  context: readonly TranslationContextEntry[];
 }
 
 export interface TranslationResult {

@@ -34,7 +34,7 @@ export interface AudioSegmentRow {
   duration_ms: number;
   captured_at: string;
   sha256: string;
-  processing_status: "stored" | "processing" | "completed" | "waiting_asr" | "waiting_translation" | "failed";
+  processing_status: "stored" | "processing" | "completed" | "waiting_asr" | "waiting_utterance" | "waiting_translation" | "failed";
   last_error: string | null;
 }
 
@@ -42,11 +42,34 @@ interface UtteranceRow {
   id: string;
   session_id: string;
   seq: number;
+  start_seq: number | null;
+  end_seq: number | null;
   text: string;
   language: string | null;
   started_at_ms: number;
   ended_at_ms: number;
   created_at: string;
+}
+
+export interface AsrFragmentRow {
+  session_id: string;
+  seq: number;
+  text: string;
+  language: string | null;
+  started_at_ms: number;
+  ended_at_ms: number;
+  created_at: string;
+}
+
+export interface TranslationContextRow {
+  sourceText: string;
+  translatedText: string | null;
+}
+
+export interface AssembledUtterance {
+  utterance: UtteranceView;
+  startSeq: number;
+  endSeq: number;
 }
 
 interface TranslationRow {
@@ -106,12 +129,25 @@ export class AppDatabase {
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         seq INTEGER NOT NULL,
+        start_seq INTEGER,
+        end_seq INTEGER,
         text TEXT NOT NULL,
         language TEXT,
         started_at_ms INTEGER NOT NULL,
         ended_at_ms INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         UNIQUE (session_id, seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS asr_fragments (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        language TEXT,
+        started_at_ms INTEGER NOT NULL,
+        ended_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, seq)
       );
 
       CREATE TABLE IF NOT EXISTS translations (
@@ -127,7 +163,17 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_audio_processing ON audio_segments(processing_status, session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_utterances_session ON utterances(session_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_fragments_session ON asr_fragments(session_id, seq);
     `);
+
+    const utteranceColumns = this.db.prepare("PRAGMA table_info(utterances)").all() as unknown as Array<{ name: string }>;
+    if (!utteranceColumns.some((column) => column.name === "start_seq")) {
+      this.db.exec("ALTER TABLE utterances ADD COLUMN start_seq INTEGER");
+    }
+    if (!utteranceColumns.some((column) => column.name === "end_seq")) {
+      this.db.exec("ALTER TABLE utterances ADD COLUMN end_seq INTEGER");
+    }
+    this.db.exec("UPDATE utterances SET start_seq = seq WHERE start_seq IS NULL; UPDATE utterances SET end_seq = seq WHERE end_seq IS NULL;");
   }
 
   createSession(input: CreateSessionRequest): SessionView {
@@ -226,7 +272,7 @@ export class AppDatabase {
   getRecoverableSegments(): AudioSegmentRow[] {
     return this.db.prepare(`
       SELECT * FROM audio_segments
-      WHERE processing_status IN ('stored', 'processing', 'waiting_asr', 'waiting_translation', 'failed')
+      WHERE processing_status IN ('stored', 'processing', 'waiting_asr', 'waiting_utterance', 'waiting_translation', 'failed')
       ORDER BY session_id, seq
     `).all() as unknown as AudioSegmentRow[];
   }
@@ -236,18 +282,66 @@ export class AppDatabase {
     return row.total;
   }
 
-  getUtterance(sessionId: string, seq: number): UtteranceView | null {
-    const row = this.db.prepare("SELECT * FROM utterances WHERE session_id = ? AND seq = ?").get(sessionId, seq) as unknown as UtteranceRow | undefined;
-    return row ? mapUtterance(row) : null;
+  getUtteranceForSegment(sessionId: string, seq: number): AssembledUtterance | null {
+    const row = this.db.prepare(`
+      SELECT * FROM utterances
+      WHERE session_id = ? AND ? BETWEEN COALESCE(start_seq, seq) AND COALESCE(end_seq, seq)
+      LIMIT 1
+    `).get(sessionId, seq) as unknown as UtteranceRow | undefined;
+    if (!row) return null;
+    return {
+      utterance: mapUtterance(row),
+      startSeq: row.start_seq ?? row.seq,
+      endSeq: row.end_seq ?? row.seq,
+    };
   }
 
-  upsertUtterance(input: { sessionId: string; seq: number; text: string; language: string | null; startedAtMs: number; endedAtMs: number }): UtteranceView {
-    const existing = this.db.prepare("SELECT * FROM utterances WHERE session_id = ? AND seq = ?").get(input.sessionId, input.seq) as unknown as UtteranceRow | undefined;
+  upsertAsrFragment(input: Omit<AsrFragmentRow, "created_at">): AsrFragmentRow {
+    const existing = this.db.prepare("SELECT * FROM asr_fragments WHERE session_id = ? AND seq = ?").get(input.session_id, input.seq) as unknown as AsrFragmentRow | undefined;
+    if (existing) return existing;
+    const row: AsrFragmentRow = { ...input, created_at: new Date().toISOString() };
+    this.db.prepare(`
+      INSERT INTO asr_fragments (session_id, seq, text, language, started_at_ms, ended_at_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(row.session_id, row.seq, row.text, row.language, row.started_at_ms, row.ended_at_ms, row.created_at);
+    return row;
+  }
+
+  getAsrFragment(sessionId: string, seq: number): AsrFragmentRow | null {
+    return (this.db.prepare("SELECT * FROM asr_fragments WHERE session_id = ? AND seq = ?").get(sessionId, seq) as unknown as AsrFragmentRow | undefined) ?? null;
+  }
+
+  getPendingAsrFragments(sessionId: string, throughSeq = Number.MAX_SAFE_INTEGER): AsrFragmentRow[] {
+    return this.db.prepare(`
+      SELECT fragment.* FROM asr_fragments fragment
+      WHERE fragment.session_id = ? AND fragment.seq <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM utterances utterance
+          WHERE utterance.session_id = fragment.session_id
+            AND fragment.seq BETWEEN COALESCE(utterance.start_seq, utterance.seq) AND COALESCE(utterance.end_seq, utterance.seq)
+        )
+      ORDER BY fragment.seq
+    `).all(sessionId, throughSeq) as unknown as AsrFragmentRow[];
+  }
+
+  getRecentAsrPrompt(sessionId: string, beforeSeq: number, maximumCharacters = 800): string {
+    const rows = this.db.prepare(`
+      SELECT text FROM asr_fragments
+      WHERE session_id = ? AND seq < ? AND text != ''
+      ORDER BY seq DESC LIMIT 4
+    `).all(sessionId, beforeSeq) as unknown as Array<{ text: string }>;
+    return rows.reverse().map((row) => row.text).join(" ").slice(-maximumCharacters);
+  }
+
+  upsertUtterance(input: { sessionId: string; startSeq: number; endSeq: number; text: string; language: string | null; startedAtMs: number; endedAtMs: number }): UtteranceView {
+    const existing = this.db.prepare("SELECT * FROM utterances WHERE session_id = ? AND COALESCE(end_seq, seq) = ?").get(input.sessionId, input.endSeq) as unknown as UtteranceRow | undefined;
     if (existing) return mapUtterance(existing);
     const row: UtteranceRow = {
       id: randomUUID(),
       session_id: input.sessionId,
-      seq: input.seq,
+      seq: input.endSeq,
+      start_seq: input.startSeq,
+      end_seq: input.endSeq,
       text: input.text,
       language: input.language,
       started_at_ms: input.startedAtMs,
@@ -255,10 +349,30 @@ export class AppDatabase {
       created_at: new Date().toISOString(),
     };
     this.db.prepare(`
-      INSERT INTO utterances (id, session_id, seq, text, language, started_at_ms, ended_at_ms, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.id, row.session_id, row.seq, row.text, row.language, row.started_at_ms, row.ended_at_ms, row.created_at);
+      INSERT INTO utterances (id, session_id, seq, start_seq, end_seq, text, language, started_at_ms, ended_at_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(row.id, row.session_id, row.seq, row.start_seq, row.end_seq, row.text, row.language, row.started_at_ms, row.ended_at_ms, row.created_at);
     return mapUtterance(row);
+  }
+
+  setAudioRangeProcessingStatus(sessionId: string, startSeq: number, endSeq: number, status: AudioSegmentRow["processing_status"], error: string | null = null): void {
+    this.db.prepare(`
+      UPDATE audio_segments SET processing_status = ?, last_error = ?
+      WHERE session_id = ? AND seq BETWEEN ? AND ?
+    `).run(status, error, sessionId, startSeq, endSeq);
+  }
+
+  getTranslationContext(sessionId: string, beforeSeq: number, targetLanguage: string, limit = 6): TranslationContextRow[] {
+    const rows = this.db.prepare(`
+      SELECT utterance.text AS sourceText, translation.text AS translatedText
+      FROM utterances utterance
+      LEFT JOIN translations translation
+        ON translation.utterance_id = utterance.id AND translation.target_language = ?
+      WHERE utterance.session_id = ? AND COALESCE(utterance.end_seq, utterance.seq) < ?
+      ORDER BY COALESCE(utterance.end_seq, utterance.seq) DESC
+      LIMIT ?
+    `).all(targetLanguage, sessionId, beforeSeq, limit) as unknown as TranslationContextRow[];
+    return rows.reverse();
   }
 
   upsertTranslation(input: { utteranceId: string; targetLanguage: string; text: string; provider: string; model: string }): TranslationView {
@@ -299,7 +413,9 @@ function mapUtterance(row: UtteranceRow): UtteranceView {
   return {
     id: row.id,
     sessionId: row.session_id,
-    seq: row.seq,
+    seq: row.end_seq ?? row.seq,
+    startSeq: row.start_seq ?? row.seq,
+    endSeq: row.end_seq ?? row.seq,
     text: row.text,
     language: row.language,
     startedAtMs: row.started_at_ms,

@@ -6,9 +6,10 @@ Windows-firstのリアルタイム文字起こし・翻訳Webアプリです。C
 
 ```text
 ブラウザ音声
-  → ローカル faster-whisper（文字起こし）
-  → ChatGPT subscription OAuth（翻訳）
-  → WebSocketで字幕表示
+  → ローカル faster-whisper（直前文脈を使った文字起こし）
+  → 未完結チャンクの発話結合
+  → ChatGPT subscription OAuth（直近の原文・訳文を使った文脈付き翻訳）
+  → WebSocketで暫定／確定字幕表示
 ```
 
 音声認識に外部APIキーは使いません。翻訳はChatGPT Plus/Pro等のサブスクリプションへブラウザでサインインします。通常のOpenAI APIキーもフォールバックとして利用できますが必須ではありません。
@@ -23,6 +24,10 @@ Windows-firstのリアルタイム文字起こし・翻訳Webアプリです。C
 - サーバーでは音声を先にファイル保存し、SQLiteへ記録
 - 切断時の再接続・再送、サーバー側の重複排除
 - ローカル`faster-whisper`による文字起こし
+- 直前の確定原文をWhisperプロンプトへ渡し、専門用語と固有名詞を継続
+- 文末、無音、15秒上限を使って5秒チャンクを発話単位へ結合
+- 未完結の発話は暫定字幕、結合後は確定字幕として表示
+- 直近6発話の原文・訳文を参照する文脈付きChatGPT翻訳
 - `@earendil-works/pi-ai`のChatGPT OAuthによる翻訳
 - 25 MB以下の音声・動画ファイル入力
 
@@ -51,8 +56,8 @@ pnpm auth:openai
 
 ```env
 WHISPER_MODEL=small
-WHISPER_DEVICE=auto
-WHISPER_COMPUTE_TYPE=default
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
 ```
 
 NVIDIA GPUと十分なVRAMがある場合は次を検討できます。

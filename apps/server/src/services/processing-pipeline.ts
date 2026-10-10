@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
-import type { ServerEvent } from "@realtime-translate/contracts";
-import { AppDatabase, type AudioSegmentRow } from "../database.js";
+import type { PartialUtteranceView, ServerEvent } from "@realtime-translate/contracts";
+import { AppDatabase, type AssembledUtterance, type AudioSegmentRow } from "../database.js";
 import type { SpeechRecognizer, Translator } from "../providers/index.js";
 import { EventHub } from "./event-hub.js";
+import { assembleUtterance, type UtteranceAssembly } from "./utterance-assembler.js";
 
 export class ProcessingPipeline {
   private readonly sessionTails = new Map<string, Promise<void>>();
@@ -19,87 +20,163 @@ export class ProcessingPipeline {
     const key = `${segment.session_id}:${segment.seq}`;
     if (this.scheduled.has(key)) return;
     this.scheduled.add(key);
+    this.appendToSession(segment.session_id, async () => {
+      try {
+        await this.process(segment);
+      } finally {
+        this.scheduled.delete(key);
+      }
+    });
+  }
 
-    const previous = this.sessionTails.get(segment.session_id) ?? Promise.resolve();
+  /** Finalize an incomplete utterance after the user stops capture. */
+  flushSession(sessionId: string): void {
+    this.appendToSession(sessionId, async () => {
+      const pending = this.database.getPendingAsrFragments(sessionId);
+      const last = pending.at(-1);
+      if (!last) return;
+      const segment = this.database.getAudioSegment(sessionId, last.seq);
+      if (segment) await this.process(segment, true);
+    });
+  }
+
+  private appendToSession(sessionId: string, work: () => Promise<void>): void {
+    const previous = this.sessionTails.get(sessionId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
-      .then(() => this.process(segment))
-      .catch((error: unknown) => console.error(`Pipeline failed for ${key}`, error))
-      .finally(() => {
-        this.scheduled.delete(key);
-        if (this.sessionTails.get(segment.session_id) === next) this.sessionTails.delete(segment.session_id);
-      });
-    this.sessionTails.set(segment.session_id, next);
+      .then(work)
+      .catch((error: unknown) => console.error(`Pipeline failed for session ${sessionId}`, error));
+    this.sessionTails.set(sessionId, next);
+    void next.then(() => {
+      if (this.sessionTails.get(sessionId) === next) this.sessionTails.delete(sessionId);
+    });
   }
 
   private publish(event: ServerEvent): void {
     this.events.publish(event);
   }
 
-  private async process(segment: AudioSegmentRow): Promise<void> {
+  private async process(originalSegment: AudioSegmentRow, forceFinalize = false): Promise<void> {
+    const segment = this.database.getAudioSegment(originalSegment.session_id, originalSegment.seq);
+    if (!segment || segment.processing_status === "completed") return;
     const session = this.database.getSession(segment.session_id);
     if (!session) return;
 
-    this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "processing");
-    let utterance = this.database.getUtterance(segment.session_id, segment.seq);
+    let assembled = this.database.getUtteranceForSegment(segment.session_id, segment.seq);
+    if (!assembled) {
+      let fragment = this.database.getAsrFragment(segment.session_id, segment.seq);
+      if (!fragment) {
+        if (!this.recognizer) {
+          this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "waiting_asr");
+          this.publish({
+            type: "processing.skipped",
+            sessionId: segment.session_id,
+            seq: segment.seq,
+            stage: "asr",
+            reason: "ローカルWhisperが無効です。音声は保存済みです。",
+          });
+          return;
+        }
 
-    if (!utterance) {
-      if (!this.recognizer) {
-        this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "waiting_asr");
-        this.publish({
-          type: "processing.skipped",
-          sessionId: segment.session_id,
-          seq: segment.seq,
-          stage: "asr",
-          reason: "ローカルWhisperが無効です。音声は保存済みです。",
+        this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "processing");
+        this.publish({ type: "asr.started", sessionId: segment.session_id, seq: segment.seq });
+        let transcription;
+        try {
+          const bytes = await readFile(segment.path);
+          transcription = await this.recognizer.transcribe(
+            {
+              bytes,
+              mimeType: segment.mime_type,
+              fileName: segment.file_name,
+              sourceLanguage: session.sourceLanguage,
+              prompt: this.database.getRecentAsrPrompt(segment.session_id, segment.seq),
+            },
+            AbortSignal.timeout(120_000),
+          );
+        } catch (error) {
+          const message = errorMessage(error);
+          this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "failed", message);
+          this.publish({ type: "processing.failed", sessionId: segment.session_id, seq: segment.seq, stage: "asr", message });
+          return;
+        }
+
+        if (!transcription.text) {
+          const pendingBeforeSilence = this.database.getPendingAsrFragments(segment.session_id, segment.seq - 1);
+          const silenceBoundary = assembleUtterance(pendingBeforeSilence, { sourceKind: session.sourceKind, force: true });
+          this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "completed");
+          if (!silenceBoundary) {
+            this.finishSessionIfReady(segment.session_id);
+            return;
+          }
+          assembled = this.persistAssembly(segment.session_id, silenceBoundary);
+        } else {
+          const startedAtMs = this.database.getAudioOffsetMs(segment.session_id, segment.seq);
+          fragment = this.database.upsertAsrFragment({
+            session_id: segment.session_id,
+            seq: segment.seq,
+            text: transcription.text,
+            language: transcription.language,
+            started_at_ms: startedAtMs,
+            ended_at_ms: startedAtMs + segment.duration_ms,
+          });
+        }
+      }
+
+      if (!assembled) {
+        const pending = this.database.getPendingAsrFragments(segment.session_id, segment.seq);
+        const assembly = assembleUtterance(pending, {
+          sourceKind: session.sourceKind,
+          force: forceFinalize || session.stoppedAt !== null,
         });
-        return;
+        if (!assembly) {
+          this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "completed");
+          this.finishSessionIfReady(segment.session_id);
+          return;
+        }
+        if (!assembly.final) {
+          this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "waiting_utterance");
+          const partial: PartialUtteranceView = {
+            sessionId: segment.session_id,
+            startSeq: assembly.startSeq,
+            endSeq: assembly.endSeq,
+            text: assembly.text,
+            language: assembly.language,
+            startedAtMs: assembly.startedAtMs,
+            endedAtMs: assembly.endedAtMs,
+          };
+          this.publish({ type: "utterance.partial", sessionId: segment.session_id, seq: assembly.endSeq, utterance: partial });
+          return;
+        }
+        assembled = this.persistAssembly(segment.session_id, assembly);
       }
-
-      this.publish({ type: "asr.started", sessionId: segment.session_id, seq: segment.seq });
-      let transcription;
-      try {
-        const bytes = await readFile(segment.path);
-        transcription = await this.recognizer.transcribe(
-          {
-            bytes,
-            mimeType: segment.mime_type,
-            fileName: segment.file_name,
-            sourceLanguage: session.sourceLanguage,
-          },
-          AbortSignal.timeout(120_000),
-        );
-      } catch (error) {
-        const message = errorMessage(error);
-        this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "failed", message);
-        this.publish({ type: "processing.failed", sessionId: segment.session_id, seq: segment.seq, stage: "asr", message });
-        return;
-      }
-
-      if (!transcription.text) {
-        this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "completed");
-        this.finishSessionIfReady(segment.session_id);
-        return;
-      }
-
-      const startedAtMs = this.database.getAudioOffsetMs(segment.session_id, segment.seq);
-      utterance = this.database.upsertUtterance({
-        sessionId: segment.session_id,
-        seq: segment.seq,
-        text: transcription.text,
-        language: transcription.language,
-        startedAtMs,
-        endedAtMs: startedAtMs + segment.duration_ms,
-      });
-      this.publish({ type: "utterance.final", sessionId: segment.session_id, seq: segment.seq, utterance });
     }
 
+    await this.translateUtterance(assembled, session.targetLanguage);
+  }
+
+  private persistAssembly(sessionId: string, assembly: UtteranceAssembly): AssembledUtterance {
+    const utterance = this.database.upsertUtterance({
+      sessionId,
+      startSeq: assembly.startSeq,
+      endSeq: assembly.endSeq,
+      text: assembly.text,
+      language: assembly.language,
+      startedAtMs: assembly.startedAtMs,
+      endedAtMs: assembly.endedAtMs,
+    });
+    this.database.setAudioRangeProcessingStatus(sessionId, assembly.startSeq, assembly.endSeq, "processing");
+    this.publish({ type: "utterance.final", sessionId, seq: assembly.endSeq, utterance });
+    return { utterance, startSeq: assembly.startSeq, endSeq: assembly.endSeq };
+  }
+
+  private async translateUtterance(assembled: AssembledUtterance, targetLanguage: string): Promise<void> {
+    const { utterance, startSeq, endSeq } = assembled;
     if (!this.translator) {
-      this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "waiting_translation");
+      this.database.setAudioRangeProcessingStatus(utterance.sessionId, startSeq, endSeq, "waiting_translation");
       this.publish({
         type: "processing.skipped",
-        sessionId: segment.session_id,
-        seq: segment.seq,
+        sessionId: utterance.sessionId,
+        seq: endSeq,
         stage: "translation",
         reason: "ChatGPTへ未ログインです。`pnpm auth:openai`を実行してサーバーを再起動してください。",
       });
@@ -109,27 +186,28 @@ export class ProcessingPipeline {
     try {
       const result = await this.translator.translate(
         {
-          sessionId: segment.session_id,
+          sessionId: utterance.sessionId,
           text: utterance.text,
           sourceLanguage: utterance.language,
-          targetLanguage: session.targetLanguage,
+          targetLanguage,
+          context: this.database.getTranslationContext(utterance.sessionId, startSeq, targetLanguage),
         },
         AbortSignal.timeout(120_000),
       );
       const translation = this.database.upsertTranslation({
         utteranceId: utterance.id,
-        targetLanguage: session.targetLanguage,
+        targetLanguage,
         text: result.text,
         provider: this.translator.provider,
         model: this.translator.model,
       });
-      this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "completed");
-      this.publish({ type: "translation.final", sessionId: segment.session_id, seq: segment.seq, translation });
-      this.finishSessionIfReady(segment.session_id);
+      this.database.setAudioRangeProcessingStatus(utterance.sessionId, startSeq, endSeq, "completed");
+      this.publish({ type: "translation.final", sessionId: utterance.sessionId, seq: endSeq, translation });
+      this.finishSessionIfReady(utterance.sessionId);
     } catch (error) {
       const message = errorMessage(error);
-      this.database.setAudioProcessingStatus(segment.session_id, segment.seq, "failed", message);
-      this.publish({ type: "processing.failed", sessionId: segment.session_id, seq: segment.seq, stage: "translation", message });
+      this.database.setAudioRangeProcessingStatus(utterance.sessionId, startSeq, endSeq, "failed", message);
+      this.publish({ type: "processing.failed", sessionId: utterance.sessionId, seq: endSeq, stage: "translation", message });
     }
   }
 

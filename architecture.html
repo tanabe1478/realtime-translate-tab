@@ -712,8 +712,8 @@
               <div class="zone-head"><span class="zone-label">Data plane</span><span class="zone-runtime">Workers</span></div>
               <h4>Processing pipeline</h4>
               <div class="component-list">
-                <div class="component external"><strong>Local Whisper adapter</strong><small>faster-whisper sidecar · 音声は端末内</small></div>
-                <div class="component external"><strong>Translation adapter</strong><small>ChatGPT OAuth · FIFO per session</small></div>
+                <div class="component external"><strong>Local Whisper adapter</strong><small>faster-whisper · 直前原文で用語を継続</small></div>
+                <div class="component external"><strong>Translation adapter</strong><small>ChatGPT OAuth · 文脈付きFIFO翻訳</small></div>
                 <div class="component optional"><strong>Insights workflow</strong><small>要約・質問・用語 · 非同期</small></div>
                 <div class="component optional"><strong>pi durable adapter</strong><small>長時間AI処理の停止・再開</small></div>
               </div>
@@ -749,12 +749,12 @@
             <button class="flow-button" id="playFlow" type="button">▶ フローを再生</button>
           </div>
           <div class="flow" id="flowSteps">
-            <div class="flow-step"><strong>Capture</strong><span>1秒前後の音声チャンクを生成。session_id と seq を付与。</span></div>
+            <div class="flow-step"><strong>Capture</strong><span>5秒の音声チャンクを生成。session_id と seq を付与。</span></div>
             <div class="flow-step"><strong>Buffer locally</strong><span>まず IndexedDB に保存。送信前のブラウザ終了にも備える。</span></div>
             <div class="flow-step"><strong>Upload</strong><span>WebSocketで送信。切断後は last_acked_seq から再開。</span></div>
             <div class="flow-step"><strong>Persist + ACK</strong><span>サーバー側の音声保存とDB記録が完了した時だけACK。</span></div>
-            <div class="flow-step"><strong>ASR final</strong><span>暫定結果はUIのみ。確定結果に utterance_id を発行。</span></div>
-            <div class="flow-step"><strong>Translate</strong><span>セッション内FIFO。確定発話を対象に冪等実行。</span></div>
+            <div class="flow-step"><strong>ASR + Assemble</strong><span>未完結チャンクを結合し、暫定／確定発話を分離。</span></div>
+            <div class="flow-step"><strong>Translate</strong><span>直近6発話の原文・訳文を参照し、確定発話だけをFIFO処理。</span></div>
             <div class="flow-step"><strong>Publish</strong><span>保存後にイベント配信。再接続時はcursor以降を再取得。</span></div>
           </div>
           <div class="flow-notes">

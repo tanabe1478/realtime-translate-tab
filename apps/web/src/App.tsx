@@ -3,6 +3,7 @@ import {
   PROTOCOL_VERSION,
   type AudioFrameHeader,
   type HealthResponse,
+  type PartialUtteranceView,
   type ServerEvent,
   type SessionStatus,
   type SessionView,
@@ -26,6 +27,7 @@ export function App() {
   const [targetLanguage, setTargetLanguage] = useState("ja");
   const [session, setSession] = useState<SessionView | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [partialUtterance, setPartialUtterance] = useState<PartialUtteranceView | null>(null);
   const [recorderState, setRecorderState] = useState<RecorderState>("idle");
   const [connection, setConnection] = useState<ConnectionState>("offline");
   const [pendingChunks, setPendingChunks] = useState(0);
@@ -116,7 +118,13 @@ export function App() {
       setPipelineStatus(`文字起こし中 · #${event.seq + 1}`);
       return;
     }
+    if (event.type === "utterance.partial") {
+      setPartialUtterance(event.utterance);
+      setPipelineStatus(`発話を組み立て中 · #${event.utterance.startSeq + 1}–${event.utterance.endSeq + 1}`);
+      return;
+    }
     if (event.type === "utterance.final") {
+      setPartialUtterance((current) => current && current.endSeq <= event.utterance.endSeq ? null : current);
       setTranscript((current) => {
         const existing = current.find((entry) => entry.utterance.id === event.utterance.id || entry.utterance.seq === event.utterance.seq);
         const next = current.filter((entry) => entry.utterance.id !== event.utterance.id && entry.utterance.seq !== event.utterance.seq);
@@ -175,6 +183,7 @@ export function App() {
       setSession(created);
       sessionRef.current = created;
       setTranscript([]);
+      setPartialUtterance(null);
       localStorage.setItem(LAST_SESSION_KEY, created.id);
       nextSeqRef.current = 0;
       const uploader = await connectUploader(created.id);
@@ -262,6 +271,7 @@ export function App() {
       setSession(created);
       sessionRef.current = created;
       setTranscript([]);
+      setPartialUtterance(null);
       localStorage.setItem(LAST_SESSION_KEY, created.id);
       const uploader = await connectUploader(created.id);
       const header: AudioFrameHeader = {
@@ -294,6 +304,7 @@ export function App() {
     setSession(null);
     sessionRef.current = null;
     setTranscript([]);
+    setPartialUtterance(null);
     setConnection("offline");
     setPipelineStatus("待機中");
     setRecorderState("idle");
@@ -401,11 +412,12 @@ export function App() {
           {notice && <div className={`notice ${notice.kind}`}><span>{noticeIcon(notice.kind)}</span><p>{notice.text}</p><button type="button" onClick={() => setNotice(null)} aria-label="閉じる">×</button></div>}
 
           <div className="transcript-scroll">
-            {transcript.length === 0 ? (
+            {transcript.length === 0 && !partialUtterance ? (
               <EmptyState sourceKind={sourceKind} recorderState={recorderState} asrReady={health?.asrReady === true} translationReady={health?.translationReady === true} />
             ) : (
               <div className="transcript-list">
                 {transcript.map((entry) => <TranscriptCard key={entry.utterance.id} entry={entry} />)}
+                {partialUtterance && <PartialTranscriptCard utterance={partialUtterance} />}
               </div>
             )}
           </div>
@@ -440,12 +452,20 @@ function EmptyState({ sourceKind, recorderState, asrReady, translationReady }: {
 
 function TranscriptCard({ entry }: { entry: TranscriptEntry }) {
   return <article className="transcript-card">
-    <div className="utterance-meta"><span>{formatTime(entry.utterance.startedAtMs)}</span><span>#{entry.utterance.seq + 1}</span><span>{entry.utterance.language?.toUpperCase() || "AUTO"}</span></div>
+    <div className="utterance-meta"><span>{formatTime(entry.utterance.startedAtMs)}</span><span>{sequenceLabel(entry.utterance.startSeq, entry.utterance.endSeq)}</span><span>{entry.utterance.language?.toUpperCase() || "AUTO"}</span></div>
     <p className="source-text">{entry.utterance.text}</p>
     <div className="translation-block">
-      <span className="translation-label">TRANSLATION</span>
+      <span className="translation-label">CONTEXT-AWARE TRANSLATION</span>
       {entry.translation ? <p>{entry.translation.text}</p> : <div className="translation-pending"><span /><span /><span /></div>}
     </div>
+  </article>;
+}
+
+function PartialTranscriptCard({ utterance }: { utterance: PartialUtteranceView }) {
+  return <article className="transcript-card partial-card" aria-live="polite">
+    <div className="utterance-meta"><span>{formatTime(utterance.startedAtMs)}</span><span>{sequenceLabel(utterance.startSeq, utterance.endSeq)}</span><span>{utterance.language?.toUpperCase() || "AUTO"}</span></div>
+    <p className="source-text">{utterance.text}</p>
+    <div className="partial-state"><span /><span>発話境界を待っています</span></div>
   </article>;
 }
 
@@ -457,6 +477,7 @@ function StatusDot({ active }: { active: boolean }) { return <i className={`stat
 function connectionLabel(value: ConnectionState) { return ({ connected: "SERVER ONLINE", connecting: "CONNECTING", offline: "OFFLINE", error: "CONNECTION ERROR" })[value]; }
 function statusToRecorderState(status: SessionStatus): RecorderState { return status === "processing" ? "processing" : "idle"; }
 function shortId(id: string) { return id.slice(0, 8).toUpperCase(); }
+function sequenceLabel(startSeq: number, endSeq: number) { return startSeq === endSeq ? `#${endSeq + 1}` : `#${startSeq + 1}–${endSeq + 1}`; }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function noticeIcon(kind: Notice["kind"]) { return ({ info: "i", warning: "!", error: "×", success: "✓" })[kind]; }
 function formatTime(milliseconds: number) { const total = Math.floor(milliseconds / 1000); return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`; }

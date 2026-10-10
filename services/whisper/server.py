@@ -72,6 +72,8 @@ async def transcribe(request: Request) -> dict[str, Any]:
     suffix = safe_suffix(file_name, request.headers.get("content-type", ""))
     language_header = request.headers.get("x-source-language")
     language = language_header.split("-")[0] if language_header else None
+    initial_prompt_header = request.headers.get("x-initial-prompt")
+    initial_prompt = unquote(initial_prompt_header)[-1000:] if initial_prompt_header else None
 
     path: str | None = None
     try:
@@ -79,18 +81,19 @@ async def transcribe(request: Request) -> dict[str, Any]:
             temporary.write(audio)
             path = temporary.name
         async with model_lock:
-            result = await asyncio.to_thread(run_transcription, path, language)
+            result = await asyncio.to_thread(run_transcription, path, language, initial_prompt)
         return result
     finally:
         if path:
             Path(path).unlink(missing_ok=True)
 
 
-def run_transcription(path: str, language: str | None) -> dict[str, Any]:
+def run_transcription(path: str, language: str | None, initial_prompt: str | None) -> dict[str, Any]:
     assert model is not None
     segments, info = model.transcribe(
         path,
         language=language,
+        initial_prompt=initial_prompt,
         beam_size=1,
         best_of=1,
         vad_filter=True,

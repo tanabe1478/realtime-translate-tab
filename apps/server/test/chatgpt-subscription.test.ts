@@ -17,9 +17,16 @@ describe("ChatGptSubscriptionTranslator", () => {
       text: "Hello",
       sourceLanguage: "en",
       targetLanguage: "ja",
+      context: [{ sourceText: "We use Durable Objects.", translatedText: "Durable Objectsを使用します。" }],
     }, AbortSignal.timeout(1_000));
 
     expect(result.text).toBe("こんにちは");
+    const prompt = JSON.parse(completeSimple.mock.calls[0]?.[1]?.messages[0]?.content as string) as {
+      recentContext: Array<{ source: string }>;
+      currentTranscript: string;
+    };
+    expect(prompt.currentTranscript).toBe("Hello");
+    expect(prompt.recentContext[0]?.source).toContain("Durable Objects");
     expect(completeSimple.mock.calls[0]?.[2]).toMatchObject({
       reasoning: "low",
       sessionId: "session-1",
