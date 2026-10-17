@@ -1,5 +1,31 @@
 const TARGET_SAMPLE_RATE = 16_000;
 
+interface YouTubeCaptureOptions extends DisplayMediaStreamOptions {
+  preferCurrentTab: true;
+  selfBrowserSurface: "include";
+  surfaceSwitching: "exclude";
+  systemAudio: "exclude";
+  audio: MediaTrackConstraints & { suppressLocalAudioPlayback: false; restrictOwnAudio: false };
+}
+
+/** These are picker hints, not a way to bypass the user's sharing permission. */
+export function getYouTubeCaptureOptions(): YouTubeCaptureOptions {
+  return {
+    video: { displaySurface: "browser" },
+    audio: {
+      suppressLocalAudioPlayback: false,
+      restrictOwnAudio: false,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    },
+    preferCurrentTab: true,
+    selfBrowserSurface: "include",
+    surfaceSwitching: "exclude",
+    systemAudio: "exclude",
+  };
+}
+
 export interface CapturedChunk {
   blob: Blob;
   capturedAt: string;
@@ -29,7 +55,7 @@ export class PcmAudioCapture {
 
   async start(stream: MediaStream): Promise<void> {
     const audioTrack = stream.getAudioTracks()[0];
-    if (!audioTrack) throw new Error("共有されたソースに音声トラックがありません。「タブの音声を共有」を有効にしてください。");
+    if (!audioTrack) throw new Error("共有されたソースに音声トラックがありません。このアプリのタブを選び、「タブの音声を共有」を有効にしてください。");
 
     this.context = new AudioContext({ latencyHint: "interactive" });
     await this.context.audioWorklet.addModule("/pcm-capture-worklet.js");

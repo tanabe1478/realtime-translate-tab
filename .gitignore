@@ -5,8 +5,11 @@ __pycache__/
 *.tsbuildinfo
 .env
 .venv-whisper/
+.runtime/
 .DS_Store
 .vite/
+test-results/
+playwright-report/
 data/*.sqlite
 data/*.sqlite-*
 data/auth.json

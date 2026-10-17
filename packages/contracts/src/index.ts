@@ -1,3 +1,6 @@
+export * from "./video-context.js";
+import type { VideoContextView } from "./video-context.js";
+
 export const PROTOCOL_VERSION = 1 as const;
 
 export type SourceKind = "microphone" | "browser-tab" | "file";
@@ -9,6 +12,7 @@ export interface CreateSessionRequest {
   sourceLanguage?: string | null;
   targetLanguage: string;
   title?: string | null;
+  videoId?: string | null;
 }
 
 export interface SessionView {
@@ -18,6 +22,7 @@ export interface SessionView {
   sourceLanguage: string | null;
   targetLanguage: string;
   title: string | null;
+  videoId: string | null;
   lastAckedSeq: number;
   createdAt: string;
   stoppedAt: string | null;
@@ -65,14 +70,22 @@ export interface TranscriptEntry {
 export interface SessionSnapshot {
   session: SessionView;
   transcript: TranscriptEntry[];
+  videoContext: VideoContextView | null;
 }
+
+export type TranslationProviderChoice = "openai" | "opencode-go";
 
 export interface HealthResponse {
   ok: true;
   asrProvider: "local-whisper" | "disabled";
   asrReady: boolean;
   asrModel: string | null;
-  translationProvider: "chatgpt-subscription" | "openai-api" | "disabled";
+  translationProvider: "chatgpt-subscription" | "openai-api" | "opencode-go" | "disabled";
+  /** Explicit server selection, even when credentials are absent. */
+  translationSelection: TranslationProviderChoice;
+  translationAuthType: "oauth" | "api_key" | null;
+  translationMessage: string | null;
+  /** Configuration exists; not a live authentication/quota check. */
   translationReady: boolean;
   translationModel: string | null;
   protocolVersion: typeof PROTOCOL_VERSION;

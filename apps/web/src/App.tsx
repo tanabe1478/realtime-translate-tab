@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   PROTOCOL_VERSION,
   type AudioFrameHeader,
@@ -9,12 +9,17 @@ import {
   type SessionView,
   type SourceKind,
   type TranscriptEntry,
+  type VideoContextView,
 } from "@realtime-translate/contracts";
-import { createSession, getHealth, getSession, stopSession } from "./api.js";
-import { PcmAudioCapture, type CapturedChunk } from "./audio-capture.js";
+import { ApiError, createSession, getHealth, getSession, stopSession } from "./api.js";
+import { getYouTubeCaptureOptions, PcmAudioCapture, type CapturedChunk } from "./audio-capture.js";
 import { ReliableUploader, type ConnectionState } from "./reliable-uploader.js";
-
-const LAST_SESSION_KEY = "realtime-translate:last-session";
+import { YouTubePlayer } from "./YouTubePlayer.js";
+import { VideoContextPanel } from "./VideoContextPanel.js";
+import { getYouTubeWatchUrl, parseYouTubeUrl, type YouTubeVideo } from "./youtube.js";
+import { translationAuthLabel, translationProviderLabel } from "./translation-provider.js";
+import { forgetMissingSessionId, readLastSessionId, rememberSessionId, sessionIdToRestore } from "./session-navigation.js";
+const YOUTUBE_VIDEO_KEY = "realtime-translate:youtube-video";
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 type RecorderState = "idle" | "requesting" | "recording" | "stopping" | "processing";
@@ -23,6 +28,8 @@ type Notice = { kind: "info" | "warning" | "error" | "success"; text: string };
 export function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [sourceKind, setSourceKind] = useState<SourceKind>("browser-tab");
+  const [youTubeVideo, setYouTubeVideo] = useState<YouTubeVideo | null>(getSavedYouTubeVideo);
+  const [videoContext, setVideoContext] = useState<VideoContextView | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("ja");
   const [session, setSession] = useState<SessionView | null>(null);
@@ -42,6 +49,8 @@ export function App() {
   const stoppingRef = useRef(false);
   const nextSeqRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const followTranscriptRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -67,7 +76,7 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const lastSessionId = localStorage.getItem(LAST_SESSION_KEY);
+      const lastSessionId = sessionIdToRestore(window.location.search, readLastSessionId());
       if (!lastSessionId) return;
       try {
         const snapshot = await getSession(lastSessionId);
@@ -75,17 +84,30 @@ export function App() {
         setSession(snapshot.session);
         sessionRef.current = snapshot.session;
         setTranscript(snapshot.transcript);
+        setSourceKind(snapshot.session.sourceKind);
+        setSourceLanguage(snapshot.session.sourceLanguage ?? "");
+        setTargetLanguage(snapshot.session.targetLanguage);
+        if (snapshot.session.videoId) setYouTubeVideo((saved) => saved?.id === snapshot.session.videoId ? saved : { id: snapshot.session.videoId!, startSeconds: 0 });
         setRecorderState(snapshot.session.status === "recording" ? "idle" : statusToRecorderState(snapshot.session.status));
         nextSeqRef.current = snapshot.session.lastAckedSeq + 1;
+        rememberSessionId(snapshot.session.id);
+        setPipelineStatus(`保存済み${snapshot.transcript.length}発話を復元`);
         await connectUploader(snapshot.session.id);
-      } catch {
-        localStorage.removeItem(LAST_SESSION_KEY);
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof ApiError && error.status === 404) forgetMissingSessionId(lastSessionId);
+        setNotice({ kind: "error", text: `保存済み字幕を復元できませんでした。${messageOf(error)}${error instanceof ApiError && error.status === 404 ? "" : " セッションの記録は保持しています。接続後に再読み込みしてください。"}` });
       }
     })();
     return () => { cancelled = true; };
     // The initial restore intentionally runs once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useLayoutEffect(() => {
+    const panel = transcriptScrollRef.current;
+    if (panel && followTranscriptRef.current) panel.scrollTop = panel.scrollHeight;
+  }, [transcript, partialUtterance, notice, youTubeVideo, sourceKind]);
 
   useEffect(() => () => {
     uploaderRef.current?.close();
@@ -160,17 +182,24 @@ export function App() {
   }
 
   async function startLiveCapture(): Promise<void> {
-    if (recorderState !== "idle" || (sourceKind !== "microphone" && sourceKind !== "browser-tab")) return;
+    if (recorderState !== "idle" || pendingChunks > 0 || (sourceKind !== "microphone" && sourceKind !== "browser-tab")) return;
+    if (sourceKind === "browser-tab" && !youTubeVideo) return;
     setNotice(null);
     setRecorderState("requesting");
     let stream: MediaStream | null = null;
     try {
       stream = sourceKind === "microphone"
         ? await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false })
-        : await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+        : await navigator.mediaDevices.getDisplayMedia(getYouTubeCaptureOptions());
 
+      if (sourceKind === "browser-tab") {
+        const surface = stream.getVideoTracks()[0]?.getSettings().displaySurface;
+        if (surface && surface !== "browser") {
+          throw new Error("画面全体やウィンドウではなく、このアプリを開いているブラウザタブを選んでください。");
+        }
+      }
       if (stream.getAudioTracks().length === 0) {
-        throw new Error("音声が共有されていません。YouTubeタブを選び、「タブの音声を共有」をオンにしてください。");
+        throw new Error("音声が共有されていません。このアプリのタブを選び、「タブの音声を共有」をオンにしてください。");
       }
       streamRef.current = stream;
 
@@ -178,13 +207,17 @@ export function App() {
         sourceKind,
         sourceLanguage: sourceLanguage || null,
         targetLanguage,
-        title: sourceKind === "browser-tab" ? "Browser tab capture" : "Microphone capture",
+        title: sourceKind === "browser-tab"
+          ? (videoContext && videoContext.videoId === youTubeVideo?.id && videoContext.targetLanguage === targetLanguage ? videoContext.metadata?.title : null) || `YouTube · ${youTubeVideo?.id}`
+          : "Microphone capture",
+        videoId: sourceKind === "browser-tab" ? youTubeVideo?.id ?? null : null,
       });
       setSession(created);
       sessionRef.current = created;
+      followTranscriptRef.current = true;
       setTranscript([]);
       setPartialUtterance(null);
-      localStorage.setItem(LAST_SESSION_KEY, created.id);
+      rememberSessionId(created.id);
       nextSeqRef.current = 0;
       const uploader = await connectUploader(created.id);
 
@@ -200,7 +233,7 @@ export function App() {
       setPipelineStatus("録音中 · 5秒ごとに保存");
       setNotice({
         kind: "success",
-        text: sourceKind === "browser-tab" ? "タブ音声を取得しています。YouTubeを再生してください。" : "マイク録音を開始しました。",
+        text: sourceKind === "browser-tab" ? "タブ音声の取得を開始しました。この画面のYouTubeプレーヤーで動画を再生してください。" : "マイク録音を開始しました。",
       });
     } catch (error) {
       stream?.getTracks().forEach((track) => track.stop());
@@ -240,11 +273,11 @@ export function App() {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       setAudioLevel(0);
-      const stopped = await stopSession(currentSession.id);
+      const stopped = await stopSession(currentSession.id, nextSeqRef.current - 1);
       setSession(stopped);
       sessionRef.current = stopped;
-      setRecorderState("processing");
-      setPipelineStatus("残りの文字起こし・翻訳を処理中");
+      setRecorderState(statusToRecorderState(stopped.status));
+      setPipelineStatus(stopped.status === "completed" ? "最新の翻訳まで完了" : "残りの文字起こし・翻訳を処理中");
     } catch (error) {
       setRecorderState("idle");
       setNotice({ kind: "error", text: messageOf(error) });
@@ -270,9 +303,10 @@ export function App() {
       });
       setSession(created);
       sessionRef.current = created;
+      followTranscriptRef.current = true;
       setTranscript([]);
       setPartialUtterance(null);
-      localStorage.setItem(LAST_SESSION_KEY, created.id);
+      rememberSessionId(created.id);
       const uploader = await connectUploader(created.id);
       const header: AudioFrameHeader = {
         version: PROTOCOL_VERSION,
@@ -285,10 +319,11 @@ export function App() {
         fileName: file.name,
       };
       await uploader.queue(header, file);
-      const stopped = await stopSession(created.id);
+      const stopped = await stopSession(created.id, 0);
       setSession(stopped);
       sessionRef.current = stopped;
-      setPipelineStatus("アップロード・処理中");
+      setRecorderState(statusToRecorderState(stopped.status));
+      setPipelineStatus(stopped.status === "completed" ? "最新の翻訳まで完了" : "アップロード・処理中");
       setNotice({ kind: "info", text: "ファイルを安全にキューへ追加しました。この画面を閉じてもIndexedDBから再送できます。" });
     } catch (error) {
       setRecorderState("idle");
@@ -296,13 +331,24 @@ export function App() {
     }
   }
 
+  function selectYouTubeVideo(video: YouTubeVideo): void {
+    setYouTubeVideo(video);
+    setNotice(null);
+    try {
+      localStorage.setItem(YOUTUBE_VIDEO_KEY, getYouTubeWatchUrl(video));
+    } catch {
+      setNotice({ kind: "warning", text: "動画は表示できますが、ブラウザの設定により次回用のURLを保存できませんでした。" });
+    }
+  }
+
   function resetSession(): void {
-    if (pendingChunks > 0 || recorderState === "recording" || recorderState === "stopping") return;
+    if (pendingChunks > 0 || recorderState === "requesting" || recorderState === "recording" || recorderState === "stopping") return;
     uploaderRef.current?.close();
     uploaderRef.current = null;
-    localStorage.removeItem(LAST_SESSION_KEY);
+    rememberSessionId(null);
     setSession(null);
     sessionRef.current = null;
+    followTranscriptRef.current = true;
     setTranscript([]);
     setPartialUtterance(null);
     setConnection("offline");
@@ -312,7 +358,8 @@ export function App() {
   }
 
   const isRecording = recorderState === "recording" || recorderState === "stopping";
-  const canStart = recorderState === "idle" && (sourceKind === "microphone" || sourceKind === "browser-tab");
+  const inputsLocked = recorderState !== "idle" || pendingChunks > 0;
+  const canStart = !inputsLocked && (sourceKind === "microphone" || (sourceKind === "browser-tab" && youTubeVideo !== null));
   const serverOnline = health?.ok === true && (!session || connection === "connected");
   const serverLabel = !health ? "CHECKING" : !session ? "SERVER ONLINE" : connectionLabel(connection);
 
@@ -331,7 +378,7 @@ export function App() {
             WHISPER {health?.asrReady ? "READY" : "OFF"}
           </span>
           <span className={`provider-chip ${health?.translationReady ? "ready" : "disabled"}`}>
-            CHATGPT {health?.translationReady ? "READY" : "OFF"}
+            {!health ? "TRANSLATION" : health.translationSelection === "opencode-go" ? "OPENCODE GO" : "OPENAI"} {health?.translationReady ? "SET" : "OFF"}
           </span>
         </div>
       </header>
@@ -341,32 +388,52 @@ export function App() {
           <div className="panel-section source-section">
             <div className="section-label">01 · INPUT SOURCE</div>
             <div className="source-grid">
-              <SourceButton active={sourceKind === "browser-tab"} icon={<TabIcon />} title="YouTube" detail="タブ音声" onClick={() => setSourceKind("browser-tab")} disabled={isRecording} recommended />
-              <SourceButton active={sourceKind === "microphone"} icon={<MicIcon />} title="マイク" detail="端末入力" onClick={() => setSourceKind("microphone")} disabled={isRecording} />
-              <SourceButton active={sourceKind === "file"} icon={<FileIcon />} title="ファイル" detail="25MBまで" onClick={() => setSourceKind("file")} disabled={isRecording} />
+              <SourceButton active={sourceKind === "browser-tab"} icon={<TabIcon />} title="YouTube" detail="ページ内再生" onClick={() => setSourceKind("browser-tab")} disabled={inputsLocked} recommended />
+              <SourceButton active={sourceKind === "microphone"} icon={<MicIcon />} title="マイク" detail="端末入力" onClick={() => setSourceKind("microphone")} disabled={inputsLocked} />
+              <SourceButton active={sourceKind === "file"} icon={<FileIcon />} title="ファイル" detail="25MBまで" onClick={() => setSourceKind("file")} disabled={inputsLocked} />
             </div>
           </div>
 
           <div className="panel-section">
             <div className="section-label">02 · LANGUAGES</div>
             <label className="field-label">音声言語</label>
-            <select value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} disabled={isRecording}>
+            <select value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} disabled={inputsLocked}>
               <option value="">自動検出</option><option value="en">英語</option><option value="ja">日本語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="es">スペイン語</option><option value="fr">フランス語</option><option value="de">ドイツ語</option>
             </select>
             <div className="language-arrow">↓</div>
             <label className="field-label">翻訳先</label>
-            <select value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} disabled={isRecording}>
+            <select value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} disabled={inputsLocked}>
               <option value="ja">日本語</option><option value="en">英語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="es">スペイン語</option><option value="fr">フランス語</option><option value="de">ドイツ語</option>
             </select>
           </div>
 
+          <section className="panel-section translation-settings" aria-label="翻訳プロバイダー設定">
+            <div className="section-label">TRANSLATION &amp; GLOSSARY</div>
+            <strong>{translationProviderLabel(health)}</strong>
+            <dl>
+              <div><dt>モデル</dt><dd>{health?.translationModel ?? "確認中"}</dd></div>
+              <div><dt>認証</dt><dd>{translationAuthLabel(health)}</dd></div>
+            </dl>
+            <p>.envのTRANSLATION_PROVIDERで切り替え後、サーバーを再起動します。自動切り替えはしません。</p>
+            {health?.translationReady && <p>設定あり · 認証・利用枠はリクエスト実行時に確認します。</p>}
+            {health?.translationMessage && <p className="translation-warning">{health.translationMessage}</p>}
+            {health?.translationSelection === "opencode-go" && <p className="translation-warning">Goはコーディングエージェント向けです。翻訳用途の利用条件を確認してください。</p>}
+          </section>
+
+          {sourceKind === "browser-tab" && youTubeVideo && <VideoContextPanel
+            key={`${youTubeVideo.id}:${targetLanguage}`}
+            videoId={youTubeVideo.id}
+            targetLanguage={targetLanguage}
+            onChange={setVideoContext}
+          />}
+
           <div className="panel-section action-section">
             {sourceKind === "browser-tab" && !isRecording && (
-              <div className="source-tip"><strong>YouTubeの使い方</strong><span>開始後にYouTubeタブを選び、「タブの音声を共有」をオンにします。</span></div>
+              <div className="source-tip"><strong>この画面だけで視聴・翻訳</strong><span>① 動画URLを入力して表示<br />②「翻訳を開始」でこのアプリのタブと音声を共有<br />③ 埋め込み動画を再生</span></div>
             )}
             {sourceKind === "file" ? (
               <>
-                <button className="primary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={recorderState !== "idle"}>
+                <button className="primary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={inputsLocked}>
                   <FileIcon /> ファイルを選択
                 </button>
                 <input ref={fileInputRef} className="hidden-input" type="file" accept="audio/*,video/*" onChange={(event) => {
@@ -381,7 +448,7 @@ export function App() {
               </button>
             ) : (
               <button className="primary-button" type="button" onClick={() => void startLiveCapture()} disabled={!canStart}>
-                <span className="record-dot" /> {recorderState === "requesting" ? "許可を待っています…" : "キャプチャを開始"}
+                <span className="record-dot" /> {recorderState === "requesting" ? "許可を待っています…" : sourceKind === "browser-tab" ? "翻訳を開始" : "録音を開始"}
               </button>
             )}
             <div className="safe-note"><ShieldIcon /><span>音声はIndexedDBへ先に保存され、サーバーACK後に削除されます。</span></div>
@@ -396,9 +463,13 @@ export function App() {
             </div>
             <div className="toolbar-actions">
               {isRecording && <AudioMeter value={audioLevel} />}
-              <button className="ghost-button" type="button" onClick={resetSession} disabled={pendingChunks > 0 || isRecording}>新規</button>
+              <button className="ghost-button" type="button" onClick={resetSession} disabled={pendingChunks > 0 || isRecording || recorderState === "requesting"}>新規</button>
             </div>
           </div>
+
+          {sourceKind === "browser-tab" && (
+            <YouTubePlayer video={youTubeVideo} disabled={inputsLocked} onVideoChange={selectYouTubeVideo} />
+          )}
 
           <div className="session-strip">
             <div className="pipeline-state"><span className={isRecording ? "pulse-dot" : "quiet-dot"} />{pipelineStatus}</div>
@@ -411,9 +482,12 @@ export function App() {
 
           {notice && <div className={`notice ${notice.kind}`}><span>{noticeIcon(notice.kind)}</span><p>{notice.text}</p><button type="button" onClick={() => setNotice(null)} aria-label="閉じる">×</button></div>}
 
-          <div className="transcript-scroll">
+          <div className="transcript-scroll" ref={transcriptScrollRef} onScroll={(event) => {
+            const panel = event.currentTarget;
+            followTranscriptRef.current = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 48;
+          }}>
             {transcript.length === 0 && !partialUtterance ? (
-              <EmptyState sourceKind={sourceKind} recorderState={recorderState} asrReady={health?.asrReady === true} translationReady={health?.translationReady === true} />
+              <EmptyState sourceKind={sourceKind} recorderState={recorderState} asrReady={health?.asrReady === true} translationReady={health?.translationReady === true} translationMessage={health?.translationMessage ?? null} />
             ) : (
               <div className="transcript-list">
                 {transcript.map((entry) => <TranscriptCard key={entry.utterance.id} entry={entry} />)}
@@ -432,6 +506,14 @@ export function App() {
   );
 }
 
+function getSavedYouTubeVideo(): YouTubeVideo | null {
+  try {
+    return parseYouTubeUrl(localStorage.getItem(YOUTUBE_VIDEO_KEY) ?? "");
+  } catch {
+    return null;
+  }
+}
+
 function SourceButton(props: { active: boolean; icon: ReactNode; title: string; detail: string; recommended?: boolean; disabled: boolean; onClick(): void }) {
   return <button type="button" className={`source-button ${props.active ? "active" : ""}`} onClick={props.onClick} disabled={props.disabled}>
     {props.recommended && <span className="recommend-tag">推奨</span>}
@@ -439,14 +521,14 @@ function SourceButton(props: { active: boolean; icon: ReactNode; title: string; 
   </button>;
 }
 
-function EmptyState({ sourceKind, recorderState, asrReady, translationReady }: { sourceKind: SourceKind; recorderState: RecorderState; asrReady: boolean; translationReady: boolean }) {
+function EmptyState({ sourceKind, recorderState, asrReady, translationReady, translationMessage }: { sourceKind: SourceKind; recorderState: RecorderState; asrReady: boolean; translationReady: boolean; translationMessage: string | null }) {
   const processing = recorderState === "recording" || recorderState === "processing" || recorderState === "stopping";
   return <div className="empty-state">
     <div className={`empty-visual ${processing ? "active" : ""}`}><WaveIcon /></div>
-    <h2>{processing ? "音声を待っています" : sourceKind === "browser-tab" ? "YouTubeをリアルタイム翻訳" : sourceKind === "microphone" ? "話した内容をその場で翻訳" : "音声・動画ファイルを翻訳"}</h2>
-    <p>{processing ? "最初の5秒チャンクが保存されると、文字起こしが始まります。" : "左側で言語を選び、キャプチャを開始してください。"}</p>
+    <h2>{processing ? "音声を待っています" : sourceKind === "browser-tab" ? "動画の原文・翻訳がここに表示されます" : sourceKind === "microphone" ? "話した内容をその場で翻訳" : "音声・動画ファイルを翻訳"}</h2>
+    <p>{processing ? "最初の5秒チャンクが保存されると、文字起こしが始まります。" : sourceKind === "browser-tab" ? "上に動画を表示し、左側の「翻訳を開始」を押してください。" : "左側で言語を選び、録音を開始するかファイルを選択してください。"}</p>
     {!asrReady && <div className="empty-warning">ローカルWhisperが未起動です — `pnpm whisper:start`を実行してください</div>}
-    {asrReady && !translationReady && <div className="empty-warning">ChatGPT未ログイン — `pnpm auth:openai`を実行してください</div>}
+    {asrReady && !translationReady && <div className="empty-warning">{translationMessage ?? "左側で翻訳プロバイダーの認証設定を確認してください。"}</div>}
   </div>;
 }
 

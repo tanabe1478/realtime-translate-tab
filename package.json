@@ -13,7 +13,9 @@
     "auth:openai:logout": "pnpm --filter @realtime-translate/server auth:openai:logout",
     "build": "pnpm -r build",
     "typecheck": "pnpm --filter @realtime-translate/contracts build && pnpm -r typecheck",
-    "test": "pnpm -r test",
+    "test": "pnpm test:setup && pnpm -r test",
+    "test:setup": "node --test scripts/*.test.mjs",
+    "test:e2e": "pnpm build && pnpm --filter @realtime-translate/web test:e2e",
     "start": "pnpm --filter @realtime-translate/server start"
   },
   "devDependencies": {
