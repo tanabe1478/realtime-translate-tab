@@ -247,12 +247,16 @@ export class ProcessingPipeline {
     }
   }
 
-  private finishSessionIfReady(sessionId: string): void {
-    if (this.database.completeSessionIfDrained(sessionId)) {
-      this.publish({ type: "session.status", sessionId, status: "completed" });
-      // Transcription finished: proofreading may now send the remainder that did not fill a batch.
-      if (this.database.getSession(sessionId)?.outputMode === "correct") this.corrections?.enqueueSession(sessionId, { resume: false });
-    }
+  /**
+   * The only place a stopped session becomes completed: the stop route and the chunk workers both call it, so the
+   * completion event and the final proofreading notice cannot diverge. Returns whether this call completed it.
+   */
+  finishSessionIfReady(sessionId: string): boolean {
+    if (!this.database.completeSessionIfDrained(sessionId)) return false;
+    this.publish({ type: "session.status", sessionId, status: "completed" });
+    // Transcription finished: proofreading may now send the remainder that did not fill a batch.
+    if (this.database.getSession(sessionId)?.outputMode === "correct") this.corrections?.enqueueSession(sessionId, { resume: false });
+    return true;
   }
 }
 

@@ -323,13 +323,7 @@ export function createApplication(options: ApplicationOptions) {
         status: session.status,
       });
       pipeline.flushSession(session.id);
-      if (database.completeSessionIfDrained(session.id)) {
-        events.publish({
-          type: "session.status",
-          sessionId: session.id,
-          status: "completed",
-        });
-      }
+      pipeline.finishSessionIfReady(session.id);
       sendJson(response, 200, database.getSession(session.id));
       return;
     }

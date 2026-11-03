@@ -221,6 +221,76 @@ describe("AI correction API", () => {
     expect(correct).toHaveBeenCalledTimes(1);
   });
 
+  async function uploadChunks(base: string, sessionId: string, count: number) {
+    const socket = new WebSocket(base.replace("http:", "ws:") + `/ws?sessionId=${sessionId}`);
+    await nextEvent(socket, "connected");
+    // The server accepts one audio frame at a time: wait for each ack.
+    for (let seq = 0; seq < count; seq += 1) {
+      const acked = nextEvent(socket, "audio.ack");
+      socket.send(encodeAudioFrame({ version: 1, sessionId, seq, capturedAt: new Date().toISOString(), durationMs: 5000, mimeType: "audio/wav", sourceKind: "file" }, new Uint8Array([seq, 2, 3])));
+      await acked;
+    }
+    return socket;
+  }
+  function collectStatuses(socket: WebSocket): string[] {
+    const statuses: string[] = [];
+    socket.on("message", (raw: Buffer) => {
+      const event = JSON.parse(raw.toString()) as ServerEvent;
+      if (event.type === "session.status") statuses.push(event.status);
+    });
+    return statuses;
+  }
+  it("proofreads the remainder when stop arrives after every chunk was already transcribed", async () => {
+    const { app, base, database, correct, transcribe } = await start();
+    let call = 0;
+    transcribe.mockImplementation(async () => ({ text: `Pi is great number ${call++}.`, language: "en" }));
+    const session = await createSession(base, "correct");
+    const socket = await uploadChunks(base, session.id, 3);
+    const completions = collectStatuses(socket);
+    await app.pipeline.waitForIdle();
+    expect(database.getSession(session.id)?.status).not.toBe("completed");
+    expect(database.getSnapshot(session.id)?.transcript).toHaveLength(3);
+    await app.corrections.waitForIdle();
+    expect(correct).not.toHaveBeenCalled();
+
+    const stopped = await fetch(`${base}/api/sessions/${session.id}/stop`, json("POST", { lastSeq: 2 }));
+    expect(stopped.status).toBe(200);
+    await app.pipeline.waitForIdle();
+    await app.corrections.waitForIdle();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(completions).toEqual(["processing", "completed"]);
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0]![0].items).toHaveLength(3);
+    const snapshot = await (await fetch(`${base}/api/sessions/${session.id}`)).json() as { session: { status: string }; transcript: Array<{ correction: { text: string } | null }> };
+    expect(snapshot.session.status).toBe("completed");
+    expect(snapshot.transcript.map((entry) => entry.correction?.text)).toEqual(["Pi (CLI) is great number 0.", "Pi (CLI) is great number 1.", "Pi (CLI) is great number 2."]);
+    socket.terminate();
+  });
+
+  it("proofreads once and publishes a single completion when stop arrives before the chunks are transcribed", async () => {
+    const { app, base, database, correct, transcribe } = await start();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let call = 0;
+    transcribe.mockImplementation(async () => { await gate; return { text: `Pi is great number ${call++}.`, language: "en" }; });
+    const session = await createSession(base, "correct");
+    const socket = await uploadChunks(base, session.id, 3);
+    const completions = collectStatuses(socket);
+    expect((await fetch(`${base}/api/sessions/${session.id}/stop`, json("POST", { lastSeq: 2 }))).status).toBe(200);
+    expect(database.getSession(session.id)?.status).toBe("processing");
+    release();
+    await app.pipeline.waitForIdle();
+    await app.corrections.waitForIdle();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(completions).toEqual(["processing", "completed"]);
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0]![0].items).toHaveLength(3);
+    expect(database.getSnapshot(session.id)!.transcript.map((entry) => entry.correction?.text)).toEqual(["Pi (CLI) is great number 0.", "Pi (CLI) is great number 1.", "Pi (CLI) is great number 2."]);
+    socket.terminate();
+  });
+
   it("aborts the proofreading request in flight when the application closes, without waiting for it", async () => {
     const directory = mkdtempSync(join(tmpdir(), "rt-http-"));
     const database = new AppDatabase(join(directory, "test.sqlite"));
