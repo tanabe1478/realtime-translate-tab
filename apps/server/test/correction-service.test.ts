@@ -251,6 +251,77 @@ describe("CorrectionService partial results", () => {
   });
 });
 
+describe("CorrectionService cross-item shift", () => {
+  const sentence = (label: string, count: number) => `${label}${"あ".repeat(count - 1)}`;
+  const texts = [sentence("A", 40), sentence("B", 40), sentence("C", 40), sentence("D", 40)];
+
+  it("keeps the original of two neighbours that exchanged a sentence and saves the others", async () => {
+    const { database, events, session, seen } = setup(texts);
+    // B gained a sentence (+20) that C lost; A and D are only touched up.
+    const answers = new Map([[texts[0]!, `${texts[0]!}。`], [texts[1]!, sentence("B", 60)], [texts[2]!, sentence("C", 20)]]);
+    const model = corrector(async (input) => ({ items: input.items.map((item) => ({ id: item.id, text: answers.get(item.text) ?? item.text })) }));
+    const service = new CorrectionService(database, events, model);
+    service.enqueueSession(session.id);
+    await service.waitForIdle();
+
+    expect(corrections(database, session.id)).toEqual([`${texts[0]!}。`, null, null, texts[3]!]);
+    const failed = seen.filter((event) => event.type === "correction.failed");
+    expect(failed.map((event) => event.seq)).toEqual([1, 2]);
+    expect(failed.every((event) => event.message.includes("文が移動した可能性"))).toBe(true);
+    expect(seen.filter((event) => event.type === "correction.final").map((event) => event.seq)).toEqual([0, 3]);
+    expect(database.getSnapshot(session.id)!.transcript.map((entry) => entry.utterance.text)).toEqual(texts);
+
+    // Not sent again automatically; an explicit enqueue (POST /correct) tries them again.
+    service.enqueueSession(session.id, { resume: false });
+    await service.waitForIdle();
+    expect(model.correctBatch).toHaveBeenCalledTimes(1);
+    service.enqueueSession(session.id);
+    await service.waitForIdle();
+    expect(model.correctBatch).toHaveBeenCalledTimes(2);
+    database.close();
+  });
+
+  it("saves a lone outlier, which is not a move", async () => {
+    const { database, events, session, seen } = setup(texts);
+    const answers = [texts[0]!, sentence("B", 60), texts[2]!, texts[3]!];
+    const model = corrector(async (input) => ({ items: input.items.map((item, index) => ({ id: item.id, text: answers[index]! })) }));
+    const service = new CorrectionService(database, events, model);
+    service.enqueueSession(session.id);
+    await service.waitForIdle();
+    expect(corrections(database, session.id)).toEqual(answers);
+    expect(seen.filter((event) => event.type === "correction.failed")).toEqual([]);
+    database.close();
+  });
+
+  it("does not pair across an item that was rejected individually", async () => {
+    const { database, events, session, seen } = setup(texts.slice(0, 3));
+    // B is missing from the response, so A (grown) and C (shrunk) are not neighbours any more.
+    const model = corrector(async (input) => ({ items: [
+      { id: input.items[0]!.id, text: sentence("A", 60) },
+      { id: input.items[2]!.id, text: sentence("C", 20) },
+    ] }));
+    const service = new CorrectionService(database, events, model);
+    service.enqueueSession(session.id);
+    await service.waitForIdle();
+    expect(corrections(database, session.id)).toEqual([sentence("A", 60), null, sentence("C", 20)]);
+    expect(seen.filter((event) => event.type === "correction.failed").map((event) => event.seq)).toEqual([1]);
+    database.close();
+  });
+
+  it("does not compare items across batches", async () => {
+    const { database, events, session, seen } = setup(texts);
+    const answers = new Map([[texts[1]!, sentence("B", 60)], [texts[2]!, sentence("C", 20)]]);
+    const model = corrector(async (input) => ({ items: input.items.map((item) => ({ id: item.id, text: answers.get(item.text) ?? item.text })) }));
+    const service = new CorrectionService(database, events, model, { batchSize: 2 });
+    service.enqueueSession(session.id);
+    await service.waitForIdle();
+    expect(batchTexts(model)).toEqual([[texts[0], texts[1]], [texts[2], texts[3]]]);
+    expect(seen.filter((event) => event.type === "correction.failed")).toEqual([]);
+    expect(corrections(database, session.id)).toEqual([texts[0], sentence("B", 60), sentence("C", 20), texts[3]]);
+    database.close();
+  });
+});
+
 describe("CorrectionService failure memory", () => {
   it("does not send failed utterances again automatically, but retries them on an explicit enqueue", async () => {
     const { database, events, session, seen } = setup(["alpha one", "bravo two", "charlie three"]);

@@ -198,6 +198,52 @@ describe("ProcessingPipeline correct sessions", () => {
   });
 });
 
+describe("ProcessingPipeline Whisper prompt", () => {
+  async function promptsFor(sourceKind: "file" | "browser-tab" | "microphone", options: { glossary?: string[] } = {}): Promise<Array<string | undefined>> {
+    const directory = mkdtempSync(join(tmpdir(), "rt-pipeline-"));
+    temporaryDirectories.push(directory);
+    const database = new AppDatabase(join(directory, "test.sqlite"));
+    const prompts: Array<string | undefined> = [];
+    const recognizer: SpeechRecognizer = {
+      provider: "test-asr",
+      model: "test",
+      checkHealth: async () => true,
+      transcribe: async (input) => {
+        prompts.push(input.prompt);
+        return { text: new TextDecoder().decode(input.bytes), language: "ja" };
+      },
+    };
+    const pipeline = new ProcessingPipeline(database, new EventHub(), recognizer, null);
+    const session = database.createSession({ sourceKind, sourceLanguage: "ja", targetLanguage: "ja", outputMode: "transcribe", ...(options.glossary ? { videoId: "video-1" } : {}) });
+    if (options.glossary) {
+      const context = database.ensureVideoContext("video-1", "ja");
+      database.saveVideoContext({ ...context, hints: { topic: "", glossary: options.glossary.map((term) => ({ term, translation: term, note: "" })) } }, context.version);
+    }
+    enqueueText(database, pipeline, directory, session.id, 0, "一つ目の発話です。");
+    enqueueText(database, pipeline, directory, session.id, 1, "二つ目の発話です。");
+    enqueueText(database, pipeline, directory, session.id, 2, "三つ目の発話です。");
+    await pipeline.waitForIdle();
+    database.close();
+    return prompts;
+  }
+
+  it("does not pass the preceding recognized text for file input, so no prompt is sent without a glossary", async () => {
+    expect(await promptsFor("file")).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("still passes glossary terms, but not the preceding recognized text, for file input", async () => {
+    const prompts = await promptsFor("file", { glossary: ["ISUCON"] });
+    expect(prompts).toEqual(["ISUCON", "ISUCON", "ISUCON"]);
+  });
+
+  it.each(["browser-tab", "microphone"] as const)("keeps passing the preceding recognized text for %s input", async (sourceKind) => {
+    const prompts = await promptsFor(sourceKind);
+    expect(prompts[0]).toBeUndefined();
+    expect(prompts[1]).toBe("一つ目の発話です。");
+    expect(prompts[2]).toBe("一つ目の発話です。 二つ目の発話です。");
+  });
+});
+
 function enqueueText(database: AppDatabase, pipeline: ProcessingPipeline, directory: string, sessionId: string, seq: number, text: string): void {
   const path = join(directory, `${seq}.txt`);
   writeFileSync(path, text);

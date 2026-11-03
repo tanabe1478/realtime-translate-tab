@@ -57,6 +57,14 @@ describe("ChatGptSubscriptionTranslator", () => {
       expect(context.systemPrompt).toMatch(/independent utterance/);
       expect(context.systemPrompt).toMatch(/never move, merge, split or reorder sentences between items/);
       expect(context.systemPrompt).toContain('{"items":[{"id":"1","text":"proofread text"}]}');
+      expect(context.systemPrompt).toMatch(/Numbers, version numbers, model names, product names and model numbers/);
+      expect(context.systemPrompt).toMatch(/never replace them with another name or another version/);
+      expect(context.systemPrompt).toMatch(/Never replace a katakana word or abbreviation you do not understand with another proper noun/);
+      expect(context.systemPrompt).toMatch(/title, recentContext or another item of the same batch gives evidence/);
+      expect(context.systemPrompt).toMatch(/start or end in the middle of a sentence/);
+      expect(context.systemPrompt).toMatch(/never move, merge or split sentences or words across item boundaries/);
+      expect(context.systemPrompt).toMatch(/only content that is in that item's original text/);
+      expect(context.systemPrompt).toMatch(/Do not add speaker names or speaker labels/);
       expect(options).toMatchObject({ reasoning: "low", sessionId: "session-1", maxRetries: 0 });
       expect(options.maxTokens).toBeUndefined();
     });

@@ -99,10 +99,7 @@ export class ProcessingPipeline {
               mimeType: segment.mime_type,
               fileName: segment.file_name,
               sourceLanguage: session.sourceLanguage,
-              prompt: buildAsrPrompt(
-                this.database.getRecentAsrPrompt(segment.session_id, segment.seq),
-                this.database.getSessionVideoContext(segment.session_id)?.hints,
-              ),
+              ...this.asrPrompt(session.sourceKind, segment.session_id, segment.seq),
             },
             AbortSignal.timeout(120_000),
           );
@@ -173,6 +170,16 @@ export class ProcessingPipeline {
       return;
     }
     await this.translateUtterance(assembled, session.targetLanguage);
+  }
+
+  /**
+   * Whisper's initial prompt. Live input passes the preceding recognized text for continuity. File input does
+   * not: with 20-30 second chunks it induced hallucinated speaker-like names; only glossary terms are passed.
+   */
+  private asrPrompt(sourceKind: string, sessionId: string, seq: number): { prompt?: string } {
+    const recent = sourceKind === "file" ? "" : this.database.getRecentAsrPrompt(sessionId, seq);
+    const prompt = buildAsrPrompt(recent, this.database.getSessionVideoContext(sessionId)?.hints);
+    return prompt ? { prompt } : {};
   }
 
   private completeTranscriptOnly(assembled: AssembledUtterance): void {

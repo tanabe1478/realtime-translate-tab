@@ -1,6 +1,6 @@
 import type { ServerEvent, UtteranceView } from "@realtime-translate/contracts";
 import type { AppDatabase } from "../database.js";
-import { correctionRejection } from "../providers/correction-guard.js";
+import { CROSS_ITEM_SHIFT_MESSAGE, correctionRejection, detectCrossItemShift } from "../providers/correction-guard.js";
 import type { TranscriptCorrector } from "../providers/types.js";
 import type { EventHub } from "./event-hub.js";
 
@@ -178,6 +178,8 @@ export class CorrectionService {
 
     const answers = new Map<string, string[]>();
     for (const item of result.items) answers.set(item.id, [...(answers.get(item.id) ?? []), item.text]);
+    // Per-item checks first; an item rejected here is excluded from the cross-item check (compared as unchanged).
+    const accepted = new Map<number, string>();
     batch.forEach((utterance, index) => {
       const texts = answers.get(String(index + 1)) ?? [];
       if (texts.length !== 1) {
@@ -191,9 +193,20 @@ export class CorrectionService {
         this.fail(sessionId, utterance, rejection);
         return;
       }
+      accepted.set(index, texts[0]!.trim());
+    });
+    // Only inside this batch: items of other requests cannot have exchanged sentences.
+    const shifted = detectCrossItemShift(batch.map((utterance, index) => ({ original: utterance.text, corrected: accepted.get(index) ?? utterance.text })));
+    batch.forEach((utterance, index) => {
+      const text = accepted.get(index);
+      if (text === undefined) return;
+      if (shifted.has(index)) {
+        this.fail(sessionId, utterance, CROSS_ITEM_SHIFT_MESSAGE);
+        return;
+      }
       const correction = this.database.upsertCorrection({
         utteranceId: utterance.id,
-        text: texts[0]!.trim(),
+        text,
         provider: corrector.provider,
         model: corrector.model,
       });
