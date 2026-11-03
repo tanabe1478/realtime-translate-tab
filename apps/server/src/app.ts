@@ -20,6 +20,7 @@ import {
 import { AppDatabase } from "./database.js";
 import type { Providers } from "./providers/index.js";
 import { AudioIngestService } from "./services/audio-ingest.js";
+import { CorrectionService, type CorrectionServiceOptions } from "./services/correction-service.js";
 import { EventHub } from "./services/event-hub.js";
 import { ProcessingPipeline } from "./services/processing-pipeline.js";
 import { VideoContextService } from "./services/video-context.js";
@@ -31,6 +32,7 @@ export interface ApplicationOptions {
   audioRoot: string;
   webRoot: string;
   metadataFetcher?: typeof fetchVideoMetadata;
+  correction?: CorrectionServiceOptions;
 }
 
 /** No listening/global side effects: also used by HTTP and end-to-end tests. */
@@ -43,6 +45,7 @@ export function createApplication(options: ApplicationOptions) {
     options.metadataFetcher,
     providers.translationIssue ?? undefined,
   );
+  const corrections = new CorrectionService(database, events, providers.corrector, options.correction);
   const pipeline = new ProcessingPipeline(
     database,
     events,
@@ -50,6 +53,7 @@ export function createApplication(options: ApplicationOptions) {
     providers.translator,
     videoContexts,
     providers.translationIssue ?? undefined,
+    corrections,
   );
   const ingest = new AudioIngestService(database, pipeline, audioRoot);
 
@@ -96,6 +100,7 @@ export function createApplication(options: ApplicationOptions) {
 
   for (const segment of database.getRecoverableSegments())
     pipeline.enqueue(segment);
+  corrections.resumePending();
 
   function attachWebSocket(webSocket: WebSocket, sessionId: string): void {
     let receiving = false;
@@ -180,6 +185,9 @@ export function createApplication(options: ApplicationOptions) {
         translationMessage: providers.translationIssue,
         translationReady: providers.translator !== null,
         translationModel: providers.translationModel,
+        correctionReady: providers.corrector !== null,
+        correctionModel: providers.corrector?.model ?? providers.correctionModel,
+        correctionMessage: providers.correctionIssue,
         protocolVersion: PROTOCOL_VERSION,
       };
       sendJson(response, 200, health);
@@ -326,6 +334,25 @@ export function createApplication(options: ApplicationOptions) {
       return;
     }
 
+    const correctMatch = /^\/api\/sessions\/([0-9a-f-]+)\/correct$/.exec(
+      url.pathname,
+    );
+    if (method === "POST" && correctMatch?.[1]) {
+      const existing = database.getSession(correctMatch[1]);
+      if (!existing) throw new HttpError(404, "Session not found");
+      if (existing.outputMode === "translate")
+        throw new HttpError(409, "翻訳セッションはAI校正できません。文字起こしのみ・AI校正つきのセッションで実行してください。");
+      if (!providers.corrector)
+        throw new HttpError(
+          503,
+          providers.correctionIssue ?? "AI校正を利用できません。選択中のプロバイダー設定を確認してください。",
+        );
+      const session = database.setSessionOutputMode(existing.id, "correct");
+      corrections.enqueueSession(existing.id);
+      sendJson(response, 202, session);
+      return;
+    }
+
     if (url.pathname.startsWith("/api/")) {
       sendJson(response, 404, { error: "Not found" });
       return;
@@ -385,6 +412,13 @@ export function createApplication(options: ApplicationOptions) {
       (!isYouTubeVideoId(body.videoId) || sourceKind !== "browser-tab")
     )
       throw new HttpError(400, "Invalid videoId");
+    if (
+      body.outputMode !== undefined &&
+      body.outputMode !== "translate" &&
+      body.outputMode !== "transcribe" &&
+      body.outputMode !== "correct"
+    )
+      throw new HttpError(400, "Invalid outputMode");
     return {
       sourceKind: sourceKind as SourceKind,
       sourceLanguage:
@@ -397,6 +431,7 @@ export function createApplication(options: ApplicationOptions) {
           ? body.title.slice(0, 200)
           : null,
       videoId: typeof body.videoId === "string" ? body.videoId : null,
+      outputMode: body.outputMode === "transcribe" || body.outputMode === "correct" ? body.outputMode : "translate",
     };
   }
 
@@ -476,6 +511,7 @@ export function createApplication(options: ApplicationOptions) {
     server,
     videoContexts,
     pipeline,
+    corrections,
     async close(): Promise<void> {
       for (const client of webSockets.clients) client.terminate();
       webSockets.close();
@@ -484,7 +520,10 @@ export function createApplication(options: ApplicationOptions) {
       );
       server.closeAllConnections();
       await stopped;
+      // Abort the proofreading request in flight first: it must not hold up shutdown.
+      corrections.close();
       await pipeline.waitForIdle();
+      await corrections.waitForIdle();
       await videoContexts.close();
       database.close();
     },

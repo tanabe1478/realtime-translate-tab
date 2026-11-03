@@ -59,3 +59,30 @@ export interface Translator {
   readonly model: string;
   translate(input: TranslationInput, signal: AbortSignal): Promise<TranslationResult>;
 }
+
+export interface CorrectionBatchItem {
+  /** Sequential id within the batch ("1" to "n"); the service maps it back to the utterance. */
+  id: string;
+  text: string;
+}
+
+export interface CorrectionBatchInput {
+  sessionId: string;
+  /** File/video title, a terminology reference only. */
+  title: string | null;
+  language: string | null;
+  /** Utterances right before the batch (corrected when available): reference context, not proofreading input. */
+  recentContext: readonly string[];
+  /** Consecutive utterances to proofread, each independently. */
+  items: readonly CorrectionBatchItem[];
+}
+
+export interface CorrectionBatchResult {
+  items: CorrectionBatchItem[];
+}
+
+export interface TranscriptCorrector {
+  readonly provider: string;
+  readonly model: string;
+  correctBatch(input: CorrectionBatchInput, signal: AbortSignal): Promise<CorrectionBatchResult>;
+}

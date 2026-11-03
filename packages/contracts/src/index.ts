@@ -6,6 +6,11 @@ export const PROTOCOL_VERSION = 1 as const;
 export type SourceKind = "microphone" | "browser-tab" | "file";
 export type SessionStatus = "created" | "recording" | "processing" | "completed" | "failed";
 export type ProcessingStage = "storage" | "asr" | "translation";
+/**
+ * "transcribe" skips translation and only produces the source-language transcript.
+ * "correct" also skips translation and has an LLM proofread each transcribed utterance.
+ */
+export type OutputMode = "translate" | "transcribe" | "correct";
 
 export interface CreateSessionRequest {
   sourceKind: SourceKind;
@@ -13,6 +18,8 @@ export interface CreateSessionRequest {
   targetLanguage: string;
   title?: string | null;
   videoId?: string | null;
+  /** Defaults to "translate" when omitted. */
+  outputMode?: OutputMode;
 }
 
 export interface SessionView {
@@ -23,6 +30,7 @@ export interface SessionView {
   targetLanguage: string;
   title: string | null;
   videoId: string | null;
+  outputMode: OutputMode;
   lastAckedSeq: number;
   createdAt: string;
   stoppedAt: string | null;
@@ -62,9 +70,20 @@ export interface TranslationView {
   createdAt: string;
 }
 
+/** LLM-proofread text of one utterance. The original Whisper text is never overwritten. */
+export interface CorrectionView {
+  id: string;
+  utteranceId: string;
+  text: string;
+  provider: string;
+  model: string;
+  createdAt: string;
+}
+
 export interface TranscriptEntry {
   utterance: UtteranceView;
   translation: TranslationView | null;
+  correction: CorrectionView | null;
 }
 
 export interface SessionSnapshot {
@@ -88,6 +107,10 @@ export interface HealthResponse {
   /** Configuration exists; not a live authentication/quota check. */
   translationReady: boolean;
   translationModel: string | null;
+  /** Configuration exists for the AI proofreading model; not a live authentication/quota check. */
+  correctionReady: boolean;
+  correctionModel: string | null;
+  correctionMessage: string | null;
   protocolVersion: typeof PROTOCOL_VERSION;
 }
 
@@ -110,6 +133,8 @@ export type ServerEvent =
   | { type: "utterance.partial"; sessionId: string; seq: number; utterance: PartialUtteranceView }
   | { type: "utterance.final"; sessionId: string; seq: number; utterance: UtteranceView }
   | { type: "translation.final"; sessionId: string; seq: number; translation: TranslationView }
+  | { type: "correction.final"; sessionId: string; seq: number; correction: CorrectionView }
+  | { type: "correction.failed"; sessionId: string; seq: number; message: string }
   | { type: "processing.skipped"; sessionId: string; seq: number; stage: "asr" | "translation"; reason: string }
   | { type: "processing.failed"; sessionId: string; seq: number; stage: ProcessingStage; message: string }
   | { type: "session.status"; sessionId: string; status: SessionStatus };

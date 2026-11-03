@@ -3,7 +3,9 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
+  CorrectionView,
   CreateSessionRequest,
+  OutputMode,
   SessionSnapshot,
   SessionStatus,
   SessionView,
@@ -22,6 +24,7 @@ interface SessionRow {
   target_language: string;
   title: string | null;
   video_id: string | null;
+  output_mode: OutputMode;
   context_through_seq: number;
   last_acked_seq: number;
   created_at: string;
@@ -73,6 +76,15 @@ export interface AssembledUtterance {
   utterance: UtteranceView;
   startSeq: number;
   endSeq: number;
+}
+
+interface CorrectionRow {
+  id: string;
+  utterance_id: string;
+  text: string;
+  provider: string;
+  model: string;
+  created_at: string;
 }
 
 interface TranslationRow {
@@ -164,6 +176,15 @@ export class AppDatabase {
         UNIQUE (utterance_id, target_language)
       );
 
+      CREATE TABLE IF NOT EXISTS corrections (
+        id TEXT PRIMARY KEY,
+        utterance_id TEXT NOT NULL UNIQUE REFERENCES utterances(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS video_contexts (
         video_id TEXT NOT NULL,
         target_language TEXT NOT NULL,
@@ -180,6 +201,7 @@ export class AppDatabase {
     const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as unknown as Array<{ name: string }>;
     if (!sessionColumns.some((column) => column.name === "video_id")) this.db.exec("ALTER TABLE sessions ADD COLUMN video_id TEXT");
     if (!sessionColumns.some((column) => column.name === "context_through_seq")) this.db.exec("ALTER TABLE sessions ADD COLUMN context_through_seq INTEGER NOT NULL DEFAULT -1");
+    if (!sessionColumns.some((column) => column.name === "output_mode")) this.db.exec("ALTER TABLE sessions ADD COLUMN output_mode TEXT NOT NULL DEFAULT 'translate'");
     if (!sessionColumns.some((column) => column.name === "expected_last_seq")) this.db.exec("ALTER TABLE sessions ADD COLUMN expected_last_seq INTEGER");
 
     const utteranceColumns = this.db.prepare("PRAGMA table_info(utterances)").all() as unknown as Array<{ name: string }>;
@@ -201,14 +223,15 @@ export class AppDatabase {
       targetLanguage: input.targetLanguage,
       title: input.title ?? null,
       videoId: input.videoId ?? null,
+      outputMode: input.outputMode ?? "translate",
       lastAckedSeq: -1,
       createdAt: new Date().toISOString(),
       stoppedAt: null,
     };
     this.db.prepare(`
-      INSERT INTO sessions (id, status, source_kind, source_language, target_language, title, video_id, last_acked_seq, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(session.id, session.status, session.sourceKind, session.sourceLanguage, session.targetLanguage, session.title, session.videoId, session.lastAckedSeq, session.createdAt);
+      INSERT INTO sessions (id, status, source_kind, source_language, target_language, title, video_id, output_mode, last_acked_seq, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(session.id, session.status, session.sourceKind, session.sourceLanguage, session.targetLanguage, session.title, session.videoId, session.outputMode, session.lastAckedSeq, session.createdAt);
     if (session.videoId) this.ensureVideoContext(session.videoId, session.targetLanguage);
     return session;
   }
@@ -223,11 +246,69 @@ export class AppDatabase {
     if (!session) return null;
     const utterances = this.db.prepare("SELECT * FROM utterances WHERE session_id = ? ORDER BY seq").all(id) as unknown as UtteranceRow[];
     const translationStatement = this.db.prepare("SELECT * FROM translations WHERE utterance_id = ? AND target_language = ?");
+    const correctionStatement = this.db.prepare("SELECT * FROM corrections WHERE utterance_id = ?");
     const transcript: TranscriptEntry[] = utterances.map((row) => {
       const translation = translationStatement.get(row.id, session.targetLanguage) as unknown as TranslationRow | undefined;
-      return { utterance: mapUtterance(row), translation: translation ? mapTranslation(translation) : null };
+      const correction = correctionStatement.get(row.id) as unknown as CorrectionRow | undefined;
+      return {
+        utterance: mapUtterance(row),
+        translation: translation ? mapTranslation(translation) : null,
+        correction: correction ? mapCorrection(correction) : null,
+      };
     });
     return { session, transcript, videoContext: session.videoId ? this.getVideoContext(session.videoId, session.targetLanguage) : null };
+  }
+
+  setSessionOutputMode(id: string, outputMode: OutputMode): SessionView | null {
+    this.db.prepare("UPDATE sessions SET output_mode = ? WHERE id = ?").run(outputMode, id);
+    return this.getSession(id);
+  }
+
+  /** Sessions whose output mode asks for proofreading, oldest first. */
+  getCorrectSessionIds(): string[] {
+    const rows = this.db.prepare("SELECT id FROM sessions WHERE output_mode = 'correct' ORDER BY created_at, id").all() as unknown as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /** Utterances of the session that have no correction yet, in seq order. */
+  getUncorrectedUtterances(sessionId: string): UtteranceView[] {
+    const rows = this.db.prepare(`
+      SELECT utterance.* FROM utterances utterance
+      WHERE utterance.session_id = ?
+        AND NOT EXISTS (SELECT 1 FROM corrections correction WHERE correction.utterance_id = utterance.id)
+      ORDER BY COALESCE(utterance.end_seq, utterance.seq)
+    `).all(sessionId) as unknown as UtteranceRow[];
+    return rows.map(mapUtterance);
+  }
+
+  /** The utterances right before `beforeSeq` as proofreading context: corrected text when present, else the original. */
+  getCorrectionContext(sessionId: string, beforeSeq: number, limit = 6): string[] {
+    const rows = this.db.prepare(`
+      SELECT COALESCE(correction.text, utterance.text) AS text
+      FROM utterances utterance
+      LEFT JOIN corrections correction ON correction.utterance_id = utterance.id
+      WHERE utterance.session_id = ? AND COALESCE(utterance.end_seq, utterance.seq) < ?
+      ORDER BY COALESCE(utterance.end_seq, utterance.seq) DESC
+      LIMIT ?
+    `).all(sessionId, beforeSeq, limit) as unknown as Array<{ text: string }>;
+    return rows.reverse().map((row) => row.text);
+  }
+
+  /** Returns the existing correction when there is one: an utterance is never proofread twice. */
+  upsertCorrection(input: { utteranceId: string; text: string; provider: string; model: string }): CorrectionView {
+    const existing = this.db.prepare("SELECT * FROM corrections WHERE utterance_id = ?").get(input.utteranceId) as unknown as CorrectionRow | undefined;
+    if (existing) return mapCorrection(existing);
+    const row: CorrectionRow = {
+      id: randomUUID(),
+      utterance_id: input.utteranceId,
+      text: input.text,
+      provider: input.provider,
+      model: input.model,
+      created_at: new Date().toISOString(),
+    };
+    this.db.prepare("INSERT INTO corrections (id, utterance_id, text, provider, model, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(row.id, row.utterance_id, row.text, row.provider, row.model, row.created_at);
+    return mapCorrection(row);
   }
 
   ensureVideoContext(videoId: string, targetLanguage: string): VideoContextView {
@@ -470,6 +551,7 @@ function mapSession(row: SessionRow): SessionView {
     targetLanguage: row.target_language,
     title: row.title,
     videoId: row.video_id,
+    outputMode: row.output_mode === "transcribe" || row.output_mode === "correct" ? row.output_mode : "translate",
     lastAckedSeq: row.last_acked_seq,
     createdAt: row.created_at,
     stoppedAt: row.stopped_at,
@@ -496,6 +578,17 @@ function mapTranslation(row: TranslationRow): TranslationView {
     id: row.id,
     utteranceId: row.utterance_id,
     targetLanguage: row.target_language,
+    text: row.text,
+    provider: row.provider,
+    model: row.model,
+    createdAt: row.created_at,
+  };
+}
+
+function mapCorrection(row: CorrectionRow): CorrectionView {
+  return {
+    id: row.id,
+    utteranceId: row.utterance_id,
     text: row.text,
     provider: row.provider,
     model: row.model,

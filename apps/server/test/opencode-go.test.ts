@@ -82,6 +82,34 @@ describe("OpenCode Go adapter (real SDK, mocked HTTP only)", () => {
     await expect(translator.translate(translation, AbortSignal.timeout(2000))).rejects.toThrow("空の応答");
   });
 
+  it("proofreads a batch through the same endpoint, key and session header with the translation output limit", async () => {
+    const { requests } = mockFetch([stream(JSON.stringify({ items: [{ id: "1", text: "ISUCONの話をします。" }, { id: "2", text: "次の話です。" }] }))]);
+    const translator = createOpenCodeGoTranslator(key)!;
+    const result = await translator.correctBatch({ sessionId: "session-1", title: "podcast", language: "ja", recentContext: ["前の発話。"], items: [{ id: "1", text: "イスコンの話をします。" }, { id: "2", text: "次の話です。" }] }, AbortSignal.timeout(2000));
+    expect(result).toEqual({ items: [{ id: "1", text: "ISUCONの話をします。" }, { id: "2", text: "次の話です。" }] });
+    expect(requests[0]!.url).toBe("https://opencode.ai/inference/go/openai/v1/chat/completions");
+    expect(requests[0]!.headers.get("authorization")).toBe(`Bearer ${key}`);
+    expect(requests[0]!.headers.get("x-opencode-session")).toBe("session-1");
+    const body = await requests[0]!.json();
+    expect(body).toMatchObject({ model: "glm-5.3-flash", max_tokens: 8000, reasoning_effort: "low", stream: true });
+    expect(JSON.parse(body.messages[1].content)).toEqual({ title: "podcast", recentContext: ["前の発話。"], items: [{ id: "1", text: "イスコンの話をします。" }, { id: "2", text: "次の話です。" }] });
+  });
+
+  it("names the proofreading model, not the translation model, in correction errors", async () => {
+    mockFetch([stream("not JSON PRIVATE_RESPONSE"), stream(JSON.stringify({ items: [] }), "length"), stream("")]);
+    const translator = createOpenCodeGoTranslator(key)!;
+    const input = { sessionId: "session-1", title: null, language: null, recentContext: [], items: [{ id: "1", text: "あ" }] };
+    const malformed = await translator.correctBatch(input, AbortSignal.timeout(2000)).catch((error: Error) => error);
+    expect((malformed as Error).message).toBe("校正モデルの応答が正しいJSON形式ではありません。");
+    await expect(translator.correctBatch(input, AbortSignal.timeout(2000))).rejects.toThrow("校正モデルの出力上限");
+    await expect(translator.correctBatch(input, AbortSignal.timeout(2000))).rejects.toThrow("校正モデルが空の応答");
+  });
+
+  it("names the correction variable when an unknown correction model is configured", () => {
+    vi.stubGlobal("fetch", vi.fn());
+    expect(() => createOpenCodeGoTranslator(key, "not-a-model", "OPENCODE_CORRECTION_MODEL")).toThrow("OPENCODE_CORRECTION_MODEL");
+  });
+
   it("does not use an ambient key and rejects unknown configured models", () => {
     vi.stubGlobal("fetch", vi.fn());
     expect(createOpenCodeGoTranslator(undefined)).toBeNull();

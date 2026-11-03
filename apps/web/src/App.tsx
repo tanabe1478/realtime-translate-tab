@@ -3,6 +3,7 @@ import {
   PROTOCOL_VERSION,
   type AudioFrameHeader,
   type HealthResponse,
+  type OutputMode,
   type PartialUtteranceView,
   type ServerEvent,
   type SessionStatus,
@@ -11,7 +12,9 @@ import {
   type TranscriptEntry,
   type VideoContextView,
 } from "@realtime-translate/contracts";
-import { ApiError, createSession, getHealth, getSession, stopSession } from "./api.js";
+import { ApiError, correctSession, createSession, getHealth, getSession, stopSession } from "./api.js";
+import { decodeAudioFileToMono16k, encodeSamplesToWav, FILE_SAMPLE_RATE, planSilenceSplits } from "./file-audio.js";
+import { formatTranscriptText } from "./transcript-export.js";
 import { getYouTubeCaptureOptions, PcmAudioCapture, type CapturedChunk } from "./audio-capture.js";
 import { ReliableUploader, type ConnectionState } from "./reliable-uploader.js";
 import { YouTubePlayer } from "./YouTubePlayer.js";
@@ -20,7 +23,7 @@ import { getYouTubeWatchUrl, parseYouTubeUrl, type YouTubeVideo } from "./youtub
 import { translationAuthLabel, translationProviderLabel } from "./translation-provider.js";
 import { forgetMissingSessionId, readLastSessionId, rememberSessionId, sessionIdToRestore } from "./session-navigation.js";
 const YOUTUBE_VIDEO_KEY = "realtime-translate:youtube-video";
-const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
 
 type RecorderState = "idle" | "requesting" | "recording" | "stopping" | "processing";
 type Notice = { kind: "info" | "warning" | "error" | "success"; text: string };
@@ -30,6 +33,7 @@ export function App() {
   const [sourceKind, setSourceKind] = useState<SourceKind>("browser-tab");
   const [youTubeVideo, setYouTubeVideo] = useState<YouTubeVideo | null>(getSavedYouTubeVideo);
   const [videoContext, setVideoContext] = useState<VideoContextView | null>(null);
+  const [fileOutputMode, setFileOutputMode] = useState<OutputMode>("translate");
   const [sourceLanguage, setSourceLanguage] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("ja");
   const [session, setSession] = useState<SessionView | null>(null);
@@ -41,12 +45,18 @@ export function App() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [pipelineStatus, setPipelineStatus] = useState("待機中");
+  /** Utterance seq -> reason, for corrections that failed in this browser session. */
+  const [correctionFailures, setCorrectionFailures] = useState<ReadonlyMap<number, string>>(new Map());
+  const [requestingCorrection, setRequestingCorrection] = useState(false);
 
   const uploaderRef = useRef<ReliableUploader | null>(null);
   const captureRef = useRef<PcmAudioCapture | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<SessionView | null>(null);
   const stoppingRef = useRef(false);
+  const fileChunkTotalRef = useRef<number | null>(null);
+  const awaitingUploadRef = useRef(false);
+  const pendingRef = useRef(0);
   const nextSeqRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
@@ -87,6 +97,7 @@ export function App() {
         setSourceKind(snapshot.session.sourceKind);
         setSourceLanguage(snapshot.session.sourceLanguage ?? "");
         setTargetLanguage(snapshot.session.targetLanguage);
+        setFileOutputMode(snapshot.session.outputMode);
         if (snapshot.session.videoId) setYouTubeVideo((saved) => saved?.id === snapshot.session.videoId ? saved : { id: snapshot.session.videoId!, startSeconds: 0 });
         setRecorderState(snapshot.session.status === "recording" ? "idle" : statusToRecorderState(snapshot.session.status));
         nextSeqRef.current = snapshot.session.lastAckedSeq + 1;
@@ -109,6 +120,16 @@ export function App() {
     if (panel && followTranscriptRef.current) panel.scrollTop = panel.scrollHeight;
   }, [transcript, partialUtterance, notice, youTubeVideo, sourceKind]);
 
+  useEffect(() => {
+    if (pendingChunks === 0) notifyUploadCompleteIfAwaited();
+  }, [pendingChunks]);
+
+  useEffect(() => {
+    if (session?.outputMode === "correct" && session.status === "completed" && transcript.length > 0 && transcript.every((entry) => entry.correction)) {
+      setPipelineStatus("校正完了");
+    }
+  }, [session, transcript]);
+
   useEffect(() => () => {
     uploaderRef.current?.close();
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -119,12 +140,18 @@ export function App() {
     const uploader = new ReliableUploader(sessionId, {
       onEvent: handleServerEvent,
       onConnectionState: setConnection,
-      onPendingCount: setPendingChunks,
+      onPendingCount: (count) => { pendingRef.current = count; setPendingChunks(count); },
       onError: (text) => setNotice({ kind: "error", text }),
     });
     uploaderRef.current = uploader;
     await uploader.start();
     return uploader;
+  }
+
+  function notifyUploadCompleteIfAwaited(): void {
+    if (!awaitingUploadRef.current || pendingRef.current > 0) return;
+    awaitingUploadRef.current = false;
+    setNotice({ kind: "success", text: "アップロード完了。このタブを閉じても文字起こしは続きます。" });
   }
 
   function handleServerEvent(event: ServerEvent): void {
@@ -137,7 +164,8 @@ export function App() {
       return;
     }
     if (event.type === "asr.started") {
-      setPipelineStatus(`文字起こし中 · #${event.seq + 1}`);
+      const total = fileChunkTotalRef.current;
+      setPipelineStatus(total !== null ? `文字起こし中 · #${event.seq + 1} / ${total}` : `文字起こし中 · #${event.seq + 1}`);
       return;
     }
     if (event.type === "utterance.partial") {
@@ -150,10 +178,26 @@ export function App() {
       setTranscript((current) => {
         const existing = current.find((entry) => entry.utterance.id === event.utterance.id || entry.utterance.seq === event.utterance.seq);
         const next = current.filter((entry) => entry.utterance.id !== event.utterance.id && entry.utterance.seq !== event.utterance.seq);
-        next.push({ utterance: event.utterance, translation: existing?.translation ?? null });
+        next.push({ utterance: event.utterance, translation: existing?.translation ?? null, correction: existing?.correction ?? null });
         return next.sort((left, right) => left.utterance.seq - right.utterance.seq);
       });
-      setPipelineStatus(`翻訳中 · #${event.seq + 1}`);
+      setPipelineStatus(skipsTranslation(sessionRef.current?.outputMode) ? `文字起こし済み · #${event.seq + 1}` : `翻訳中 · #${event.seq + 1}`);
+      return;
+    }
+    if (event.type === "correction.final") {
+      setTranscript((current) => current.map((entry) => entry.utterance.id === event.correction.utteranceId ? { ...entry, correction: event.correction } : entry));
+      setCorrectionFailures((current) => {
+        if (!current.has(event.seq)) return current;
+        const next = new Map(current);
+        next.delete(event.seq);
+        return next;
+      });
+      setPipelineStatus(`校正中 · #${event.seq + 1}`);
+      return;
+    }
+    if (event.type === "correction.failed") {
+      setCorrectionFailures((current) => new Map(current).set(event.seq, event.message));
+      setPipelineStatus(`校正エラー · #${event.seq + 1}`);
       return;
     }
     if (event.type === "translation.final") {
@@ -162,6 +206,8 @@ export function App() {
       return;
     }
     if (event.type === "processing.skipped") {
+      // Transcript-only and proofread sessions never translate: a missing translation login is irrelevant.
+      if (event.stage === "translation" && skipsTranslation(sessionRef.current?.outputMode)) return;
       setPipelineStatus(event.stage === "asr" ? "音声保存済み · ASR待機" : "原文保存済み · 翻訳待機");
       setNotice({ kind: "warning", text: event.reason });
       return;
@@ -177,7 +223,11 @@ export function App() {
         sessionRef.current = next;
         return next;
       });
-      if (event.status === "completed") setRecorderState("idle");
+      if (event.status === "completed") {
+        setRecorderState("idle");
+        const mode = sessionRef.current?.outputMode;
+        if (skipsTranslation(mode)) setPipelineStatus(completedStatus(mode));
+      }
     }
   }
 
@@ -185,6 +235,7 @@ export function App() {
     if (recorderState !== "idle" || pendingChunks > 0 || (sourceKind !== "microphone" && sourceKind !== "browser-tab")) return;
     if (sourceKind === "browser-tab" && !youTubeVideo) return;
     setNotice(null);
+    fileChunkTotalRef.current = null;
     setRecorderState("requesting");
     let stream: MediaStream | null = null;
     try {
@@ -217,6 +268,7 @@ export function App() {
       followTranscriptRef.current = true;
       setTranscript([]);
       setPartialUtterance(null);
+      setCorrectionFailures(new Map());
       rememberSessionId(created.id);
       nextSeqRef.current = 0;
       const uploader = await connectUploader(created.id);
@@ -288,47 +340,108 @@ export function App() {
 
   async function processFile(file: File): Promise<void> {
     if (file.size > MAX_FILE_BYTES) {
-      setNotice({ kind: "error", text: "現在のMVPでは25MB以下の音声・動画ファイルに対応しています。" });
+      setNotice({ kind: "error", text: "現在のMVPでは100MB以下の音声・動画ファイルに対応しています。" });
+      return;
+    }
+    if (fileOutputMode === "correct" && health?.correctionReady !== true) {
+      setNotice({ kind: "error", text: health?.correctionMessage ?? "AI校正を利用できません。サーバーの設定を確認してください。" });
       return;
     }
     setNotice(null);
     setRecorderState("processing");
-    setPipelineStatus("ファイルをローカルバッファへ保存中");
+    setPipelineStatus("セッションを作成中");
+    fileChunkTotalRef.current = null;
+    awaitingUploadRef.current = false;
+    nextSeqRef.current = 0;
+    let created: SessionView | null = null;
+    let queuedChunks = 0;
     try {
-      const created = await createSession({
+      created = await createSession({
         sourceKind: "file",
         sourceLanguage: sourceLanguage || null,
         targetLanguage,
         title: file.name,
+        outputMode: fileOutputMode,
       });
       setSession(created);
       sessionRef.current = created;
       followTranscriptRef.current = true;
       setTranscript([]);
       setPartialUtterance(null);
+      setCorrectionFailures(new Map());
       rememberSessionId(created.id);
       const uploader = await connectUploader(created.id);
-      const header: AudioFrameHeader = {
-        version: PROTOCOL_VERSION,
-        sessionId: created.id,
-        seq: 0,
-        capturedAt: new Date().toISOString(),
-        durationMs: 0,
-        mimeType: file.type || "application/octet-stream",
-        sourceKind: "file",
-        fileName: file.name,
-      };
-      await uploader.queue(header, file);
-      const stopped = await stopSession(created.id, 0);
+
+      setPipelineStatus("音声を展開中（再生はしません）");
+      const samples = await decodeAudioFileToMono16k(file);
+      const ranges = planSilenceSplits(samples, FILE_SAMPLE_RATE);
+      if (ranges.length === 0) throw new Error("ファイルに音声がありません。");
+      fileChunkTotalRef.current = ranges.length;
+
+      const capturedAt = Date.now();
+      for (const [seq, range] of ranges.entries()) {
+        setPipelineStatus(`チャンクを保存中 · ${seq + 1} / ${ranges.length}`);
+        const header: AudioFrameHeader = {
+          version: PROTOCOL_VERSION,
+          sessionId: created.id,
+          seq,
+          capturedAt: new Date(capturedAt + (range.start / FILE_SAMPLE_RATE) * 1000).toISOString(),
+          durationMs: Math.round(((range.end - range.start) / FILE_SAMPLE_RATE) * 1000),
+          mimeType: "audio/wav",
+          sourceKind: "file",
+          fileName: `segment-${String(seq).padStart(6, "0")}.wav`,
+        };
+        await uploader.queue(header, encodeSamplesToWav(samples.subarray(range.start, range.end)));
+        queuedChunks += 1;
+      }
+      awaitingUploadRef.current = true;
+      nextSeqRef.current = ranges.length;
+      const stopped = await stopSession(created.id, ranges.length - 1);
       setSession(stopped);
       sessionRef.current = stopped;
       setRecorderState(statusToRecorderState(stopped.status));
-      setPipelineStatus(stopped.status === "completed" ? "最新の翻訳まで完了" : "アップロード・処理中");
-      setNotice({ kind: "info", text: "ファイルを安全にキューへ追加しました。この画面を閉じてもIndexedDBから再送できます。" });
+      setPipelineStatus(stopped.status === "completed" ? completedStatus(stopped.outputMode) : "アップロード・処理中");
+      notifyUploadCompleteIfAwaited();
     } catch (error) {
+      awaitingUploadRef.current = false;
+      fileChunkTotalRef.current = null;
       setRecorderState("idle");
+      setPipelineStatus("待機中");
       setNotice({ kind: "error", text: messageOf(error) });
+      // Close the empty session so it does not stay in "processing" forever.
+      if (created && queuedChunks === 0) void stopSession(created.id, -1).catch(() => undefined);
     }
+  }
+
+  async function runCorrection(): Promise<void> {
+    const current = sessionRef.current;
+    if (!current || requestingCorrection) return;
+    setRequestingCorrection(true);
+    try {
+      const updated = await correctSession(current.id);
+      setCorrectionFailures(new Map());
+      setSession(updated);
+      sessionRef.current = updated;
+      setFileOutputMode(updated.outputMode);
+      setPipelineStatus("校正中");
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: messageOf(error) });
+    } finally {
+      setRequestingCorrection(false);
+    }
+  }
+
+  function downloadTranscript(): void {
+    const text = formatTranscriptText(transcript);
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${transcriptFileBase(session?.title ?? null)}.txt`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
   function selectYouTubeVideo(video: YouTubeVideo): void {
@@ -351,6 +464,8 @@ export function App() {
     followTranscriptRef.current = true;
     setTranscript([]);
     setPartialUtterance(null);
+    setCorrectionFailures(new Map());
+    fileChunkTotalRef.current = null;
     setConnection("offline");
     setPipelineStatus("待機中");
     setRecorderState("idle");
@@ -360,6 +475,10 @@ export function App() {
   const isRecording = recorderState === "recording" || recorderState === "stopping";
   const inputsLocked = recorderState !== "idle" || pendingChunks > 0;
   const canStart = !inputsLocked && (sourceKind === "microphone" || (sourceKind === "browser-tab" && youTubeVideo !== null));
+  const correctionReady = health?.correctionReady === true;
+  const correctedCount = transcript.filter((entry) => entry.correction).length;
+  const canRunCorrection = session !== null && skipsTranslation(session.outputMode) && correctedCount < transcript.length && correctionReady;
+  const translationFree = skipsTranslation(session?.outputMode) || (sourceKind === "file" && skipsTranslation(fileOutputMode));
   const serverOnline = health?.ok === true && (!session || connection === "connected");
   const serverLabel = !health ? "CHECKING" : !session ? "SERVER ONLINE" : connectionLabel(connection);
 
@@ -390,7 +509,7 @@ export function App() {
             <div className="source-grid">
               <SourceButton active={sourceKind === "browser-tab"} icon={<TabIcon />} title="YouTube" detail="ページ内再生" onClick={() => setSourceKind("browser-tab")} disabled={inputsLocked} recommended />
               <SourceButton active={sourceKind === "microphone"} icon={<MicIcon />} title="マイク" detail="端末入力" onClick={() => setSourceKind("microphone")} disabled={inputsLocked} />
-              <SourceButton active={sourceKind === "file"} icon={<FileIcon />} title="ファイル" detail="25MBまで" onClick={() => setSourceKind("file")} disabled={inputsLocked} />
+              <SourceButton active={sourceKind === "file"} icon={<FileIcon />} title="ファイル" detail="100MBまで" onClick={() => setSourceKind("file")} disabled={inputsLocked} />
             </div>
           </div>
 
@@ -433,6 +552,12 @@ export function App() {
             )}
             {sourceKind === "file" ? (
               <>
+                <div className="mode-toggle" role="group" aria-label="出力モード">
+                  <button type="button" className={fileOutputMode === "translate" ? "active" : ""} aria-pressed={fileOutputMode === "translate"} onClick={() => setFileOutputMode("translate")} disabled={inputsLocked}>翻訳する</button>
+                  <button type="button" className={fileOutputMode === "transcribe" ? "active" : ""} aria-pressed={fileOutputMode === "transcribe"} onClick={() => setFileOutputMode("transcribe")} disabled={inputsLocked}>文字起こしのみ</button>
+                  <button type="button" className={fileOutputMode === "correct" ? "active" : ""} aria-pressed={fileOutputMode === "correct"} onClick={() => setFileOutputMode("correct")} disabled={inputsLocked || !correctionReady}>AI校正つき</button>
+                </div>
+                {health && !health.correctionReady && <p className="mode-note">AI校正を利用できません: {health.correctionMessage ?? "校正モデルの設定を確認してください。"}</p>}
                 <button className="primary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={inputsLocked}>
                   <FileIcon /> ファイルを選択
                 </button>
@@ -463,6 +588,8 @@ export function App() {
             </div>
             <div className="toolbar-actions">
               {isRecording && <AudioMeter value={audioLevel} />}
+              {canRunCorrection && <button className="ghost-button" type="button" onClick={() => void runCorrection()} disabled={requestingCorrection}>AI校正を実行</button>}
+              {transcript.length > 0 && <button className="ghost-button" type="button" onClick={downloadTranscript}>テキストで保存</button>}
               <button className="ghost-button" type="button" onClick={resetSession} disabled={pendingChunks > 0 || isRecording || recorderState === "requesting"}>新規</button>
             </div>
           </div>
@@ -475,6 +602,7 @@ export function App() {
             <div className="pipeline-state"><span className={isRecording ? "pulse-dot" : "quiet-dot"} />{pipelineStatus}</div>
             <div className="strip-metrics">
               <span><b>{transcript.length}</b> 発話</span>
+              {session?.outputMode === "correct" && <span className="correction-progress">校正済み {correctedCount} / {transcript.length}</span>}
               <span><b>{pendingChunks}</b> 未送信</span>
               <span>{session ? shortId(session.id) : "NO SESSION"}</span>
             </div>
@@ -487,17 +615,17 @@ export function App() {
             followTranscriptRef.current = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 48;
           }}>
             {transcript.length === 0 && !partialUtterance ? (
-              <EmptyState sourceKind={sourceKind} recorderState={recorderState} asrReady={health?.asrReady === true} translationReady={health?.translationReady === true} translationMessage={health?.translationMessage ?? null} />
+              <EmptyState sourceKind={sourceKind} recorderState={recorderState} outputMode={session?.outputMode ?? fileOutputMode} asrReady={health?.asrReady === true} translationReady={health?.translationReady === true || translationFree} translationMessage={health?.translationMessage ?? null} />
             ) : (
               <div className="transcript-list">
-                {transcript.map((entry) => <TranscriptCard key={entry.utterance.id} entry={entry} />)}
+                {transcript.map((entry) => <TranscriptCard key={entry.utterance.id} entry={entry} showTranslation={(session?.outputMode ?? "translate") === "translate"} correctionLabel={correctionLabelOf(entry, session?.outputMode, correctionFailures, health?.correctionReady !== false)} />)}
                 {partialUtterance && <PartialTranscriptCard utterance={partialUtterance} />}
               </div>
             )}
           </div>
 
           <footer className="panel-footer">
-            <span>音声: 16 kHz mono PCM/WAV · 5秒チャンク</span>
+            <span>{(session?.sourceKind ?? sourceKind) === "file" ? "音声: 16 kHz mono WAV · 20〜30秒ごとに分割" : "音声: 16 kHz mono PCM/WAV · 5秒チャンク"}</span>
             <span>Protocol v{PROTOCOL_VERSION}</span>
           </footer>
         </main>
@@ -521,25 +649,45 @@ function SourceButton(props: { active: boolean; icon: ReactNode; title: string; 
   </button>;
 }
 
-function EmptyState({ sourceKind, recorderState, asrReady, translationReady, translationMessage }: { sourceKind: SourceKind; recorderState: RecorderState; asrReady: boolean; translationReady: boolean; translationMessage: string | null }) {
+function EmptyState({ sourceKind, recorderState, outputMode, asrReady, translationReady, translationMessage }: { sourceKind: SourceKind; recorderState: RecorderState; outputMode: OutputMode; asrReady: boolean; translationReady: boolean; translationMessage: string | null }) {
   const processing = recorderState === "recording" || recorderState === "processing" || recorderState === "stopping";
+  const fileHeading = outputMode === "correct" ? "音声・動画ファイルを文字起こしして校正" : outputMode === "transcribe" ? "音声・動画ファイルを文字起こし" : "音声・動画ファイルを翻訳";
+  const heading = sourceKind === "file" && !processing ? fileHeading : processing ? "音声を待っています" : sourceKind === "browser-tab" ? "動画の原文・翻訳がここに表示されます" : sourceKind === "microphone" ? "話した内容をその場で翻訳" : fileHeading;
+  const description = sourceKind === "file"
+    ? (processing ? "ファイルを展開し、無音の位置で区切って順に文字起こしします。結果は処理が進むたびに表示されます。" : "左側で出力モードと言語を選び、ファイルを選択してください。")
+    : processing ? "最初の5秒チャンクが保存されると、文字起こしが始まります。" : sourceKind === "browser-tab" ? "上に動画を表示し、左側の「翻訳を開始」を押してください。" : "左側で言語を選び、録音を開始するかファイルを選択してください。";
   return <div className="empty-state">
     <div className={`empty-visual ${processing ? "active" : ""}`}><WaveIcon /></div>
-    <h2>{processing ? "音声を待っています" : sourceKind === "browser-tab" ? "動画の原文・翻訳がここに表示されます" : sourceKind === "microphone" ? "話した内容をその場で翻訳" : "音声・動画ファイルを翻訳"}</h2>
-    <p>{processing ? "最初の5秒チャンクが保存されると、文字起こしが始まります。" : sourceKind === "browser-tab" ? "上に動画を表示し、左側の「翻訳を開始」を押してください。" : "左側で言語を選び、録音を開始するかファイルを選択してください。"}</p>
+    <h2>{heading}</h2>
+    <p>{description}</p>
     {!asrReady && <div className="empty-warning">ローカルWhisperが未起動です — `pnpm whisper:start`を実行してください</div>}
     {asrReady && !translationReady && <div className="empty-warning">{translationMessage ?? "左側で翻訳プロバイダーの認証設定を確認してください。"}</div>}
   </div>;
 }
 
-function TranscriptCard({ entry }: { entry: TranscriptEntry }) {
+type CorrectionLabel = { kind: "pending" | "failed" | "stalled"; text: string; title?: string };
+
+function correctionLabelOf(entry: TranscriptEntry, mode: OutputMode | undefined, failures: ReadonlyMap<number, string>, correctionReady: boolean): CorrectionLabel | null {
+  if (mode !== "correct" || entry.correction) return null;
+  const failure = failures.get(entry.utterance.seq);
+  if (failure !== undefined) return { kind: "failed", text: "校正失敗（原文を表示）", title: failure };
+  if (!correctionReady) return { kind: "stalled", text: "未校正（校正を利用できません）" };
+  return { kind: "pending", text: "校正中" };
+}
+
+function TranscriptCard({ entry, showTranslation, correctionLabel }: { entry: TranscriptEntry; showTranslation: boolean; correctionLabel: CorrectionLabel | null }) {
+  const corrected = entry.correction;
   return <article className="transcript-card">
-    <div className="utterance-meta"><span>{formatTime(entry.utterance.startedAtMs)}</span><span>{sequenceLabel(entry.utterance.startSeq, entry.utterance.endSeq)}</span><span>{entry.utterance.language?.toUpperCase() || "AUTO"}</span></div>
-    <p className="source-text">{entry.utterance.text}</p>
-    <div className="translation-block">
+    <div className="utterance-meta">
+      <span>{formatTime(entry.utterance.startedAtMs)}</span><span>{sequenceLabel(entry.utterance.startSeq, entry.utterance.endSeq)}</span><span>{entry.utterance.language?.toUpperCase() || "AUTO"}</span>
+      {correctionLabel && <span className={`correction-label ${correctionLabel.kind}`} title={correctionLabel.title}>{correctionLabel.text}</span>}
+    </div>
+    <p className="source-text">{corrected ? corrected.text : entry.utterance.text}</p>
+    {corrected && <details className="original-text"><summary>Whisperの原文</summary><p>{entry.utterance.text}</p></details>}
+    {showTranslation && <div className="translation-block">
       <span className="translation-label">CONTEXT-AWARE TRANSLATION</span>
       {entry.translation ? <p>{entry.translation.text}</p> : <div className="translation-pending"><span /><span /><span /></div>}
-    </div>
+    </div>}
   </article>;
 }
 
@@ -557,7 +705,16 @@ function AudioMeter({ value }: { value: number }) {
 
 function StatusDot({ active }: { active: boolean }) { return <i className={`status-dot ${active ? "active" : ""}`} />; }
 function connectionLabel(value: ConnectionState) { return ({ connected: "SERVER ONLINE", connecting: "CONNECTING", offline: "OFFLINE", error: "CONNECTION ERROR" })[value]; }
+/** Transcript-only and proofread sessions never translate. */
+function skipsTranslation(mode: OutputMode | undefined): boolean { return mode === "transcribe" || mode === "correct"; }
+function completedStatus(mode: OutputMode | undefined): string {
+  return mode === "correct" ? "文字起こし完了 · 校正中" : mode === "transcribe" ? "文字起こし完了" : "最新の翻訳まで完了";
+}
 function statusToRecorderState(status: SessionStatus): RecorderState { return status === "processing" ? "processing" : "idle"; }
+function transcriptFileBase(title: string | null): string {
+  const base = (title ?? "").replace(/\.[A-Za-z0-9]{1,5}$/, "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim().slice(0, 80);
+  return base || "transcript";
+}
 function shortId(id: string) { return id.slice(0, 8).toUpperCase(); }
 function sequenceLabel(startSeq: number, endSeq: number) { return startSeq === endSeq ? `#${endSeq + 1}` : `#${startSeq + 1}–${endSeq + 1}`; }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }

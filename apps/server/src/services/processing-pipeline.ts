@@ -6,6 +6,7 @@ import { EventHub } from "./event-hub.js";
 import { assembleUtterance, type UtteranceAssembly } from "./utterance-assembler.js";
 import { buildAsrPrompt } from "./context-hints.js";
 import type { VideoContextService } from "./video-context.js";
+import type { CorrectionService } from "./correction-service.js";
 
 export class ProcessingPipeline {
   private readonly sessionTails = new Map<string, Promise<void>>();
@@ -18,6 +19,7 @@ export class ProcessingPipeline {
     private readonly translator: Translator | null,
     private readonly videoContexts?: Pick<VideoContextService, "onUtterance">,
     private readonly translationUnavailableReason = "翻訳の認証が未設定です。選択中のプロバイダー設定を確認してサーバーを再起動してください。",
+    private readonly corrections?: Pick<CorrectionService, "enqueueSession">,
   ) {}
 
   async waitForIdle(): Promise<void> {
@@ -162,7 +164,21 @@ export class ProcessingPipeline {
       }
     }
 
+    // Re-read: POST /correct may have switched the mode while this chunk was in ASR.
+    const outputMode = this.database.getSession(session.id)?.outputMode ?? session.outputMode;
+    if (outputMode === "transcribe" || outputMode === "correct") {
+      this.completeTranscriptOnly(assembled);
+      // Proofreading runs in its own queue; chunk completion never waits for it.
+      if (outputMode === "correct") this.corrections?.enqueueSession(session.id, { resume: false });
+      return;
+    }
     await this.translateUtterance(assembled, session.targetLanguage);
+  }
+
+  private completeTranscriptOnly(assembled: AssembledUtterance): void {
+    const { utterance, startSeq, endSeq } = assembled;
+    this.database.setAudioRangeProcessingStatus(utterance.sessionId, startSeq, endSeq, "completed");
+    this.finishSessionIfReady(utterance.sessionId);
   }
 
   private persistAssembly(sessionId: string, assembly: UtteranceAssembly): AssembledUtterance {
@@ -227,6 +243,8 @@ export class ProcessingPipeline {
   private finishSessionIfReady(sessionId: string): void {
     if (this.database.completeSessionIfDrained(sessionId)) {
       this.publish({ type: "session.status", sessionId, status: "completed" });
+      // Transcription finished: proofreading may now send the remainder that did not fill a batch.
+      if (this.database.getSession(sessionId)?.outputMode === "correct") this.corrections?.enqueueSession(sessionId, { resume: false });
     }
   }
 }

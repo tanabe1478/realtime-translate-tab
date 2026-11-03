@@ -7,6 +7,7 @@ import { encodeAudioFrame, type ServerEvent, type VideoContextView } from "@real
 import { AppDatabase } from "../src/database.js";
 import { createApplication } from "../src/app.js";
 import type { Providers } from "../src/providers/index.js";
+import type { CorrectionBatchInput } from "../src/providers/types.js";
 
 const running: Array<{ app: ReturnType<typeof createApplication>; directory: string }> = [];
 afterEach(async () => {
@@ -21,6 +22,7 @@ async function start(overrides: Partial<Providers> = {}) {
   const database = new AppDatabase(join(directory, "test.sqlite"));
   const transcribe = vi.fn(async () => ({ text: "Pi supports tool calling.", language: "en" }));
   const translate = vi.fn(async () => ({ text: "Piはツール呼び出しに対応します。" }));
+  const correct = vi.fn(async (input: CorrectionBatchInput, _signal?: AbortSignal) => ({ items: input.items.map((item) => ({ id: item.id, text: item.text.replace("Pi", "Pi (CLI)") })) }));
   const app = createApplication({
     database, audioRoot: join(directory, "audio"), webRoot: join(directory, "web"),
     metadataFetcher: async () => ({ title: "Pi coding agent", authorName: "Armin" }),
@@ -28,6 +30,7 @@ async function start(overrides: Partial<Providers> = {}) {
       recognizer: { provider: "test", model: "test", checkHealth: async () => true, transcribe },
       translator: { provider: "test", model: "test", translate }, translationAuthType: "oauth",
       translationSelection: "openai", translationModel: "test", translationIssue: null,
+      corrector: { provider: "test", model: "test-correction", correctBatch: correct }, correctionModel: "test-correction", correctionIssue: null,
       contextGenerator: { generateContext: async () => ({ topic: "エージェント", glossary: [{ term: "Pi", translation: "Pi", note: "" }] }) },
       ...overrides,
     },
@@ -37,7 +40,7 @@ async function start(overrides: Partial<Providers> = {}) {
   const address = app.server.address();
   if (!address || typeof address === "string") throw new Error("Missing address");
   const base = `http://127.0.0.1:${address.port}`;
-  return { app, database, base, transcribe, translate };
+  return { app, database, base, transcribe, translate, correct };
 }
 function json(method: string, body: unknown): RequestInit {
   return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
@@ -98,6 +101,155 @@ describe("context HTTP + audio pipeline integration", () => {
     expect((await fetch(base + contextPath, { ...json("POST", {}), headers: { "Content-Type": "application/json", Origin: "https://untrusted.example" } })).status).toBe(403);
     expect((await fetch(base + "/api/sessions", json("POST", { sourceKind: "microphone", videoId: "HDdbU10r7Js", targetLanguage: "ja" }))).status).toBe(400);
     expect((await fetch(base + "/api/sessions", json("POST", { sourceKind: "browser-tab", targetLanguage: "ja", title: "x".repeat(70_000) }))).status).toBe(413);
+  });
+});
+
+describe("outputMode API", () => {
+  it("stores transcribe, defaults to translate and rejects unknown values", async () => {
+    const { base } = await start();
+    const create = async (extra: Record<string, unknown>) => fetch(base + "/api/sessions", json("POST", { sourceKind: "file", targetLanguage: "ja", ...extra }));
+    expect(((await (await create({})).json()) as { outputMode: string }).outputMode).toBe("translate");
+    expect(((await (await create({ outputMode: "translate" })).json()) as { outputMode: string }).outputMode).toBe("translate");
+    const transcribe = await (await create({ outputMode: "transcribe" })).json() as { id: string; outputMode: string };
+    expect(transcribe.outputMode).toBe("transcribe");
+    expect(((await (await fetch(`${base}/api/sessions/${transcribe.id}`)).json()) as { session: { outputMode: string } }).session.outputMode).toBe("transcribe");
+    for (const outputMode of ["summarize", "", null, 1, true]) expect((await create({ outputMode })).status).toBe(400);
+  });
+});
+
+describe("AI correction API", () => {
+  async function createSession(base: string, outputMode: string) {
+    return await (await fetch(base + "/api/sessions", json("POST", { sourceKind: "file", sourceLanguage: "en", targetLanguage: "ja", title: "talk.mp3", outputMode }))).json() as { id: string; outputMode: string };
+  }
+  function addUtterance(database: AppDatabase, sessionId: string, seq: number, text: string) {
+    return database.upsertUtterance({ sessionId, startSeq: seq, endSeq: seq, text, language: "en", startedAtMs: seq * 1_000, endedAtMs: seq * 1_000 + 900 });
+  }
+
+  it("reports correction readiness in /api/health", async () => {
+    const ready = await start();
+    expect(await (await fetch(ready.base + "/api/health")).json()).toMatchObject({ correctionReady: true, correctionModel: "test-correction", correctionMessage: null });
+    const issue = "校正モデルgpt-5.6-terraを利用できません。";
+    const unavailable = await start({ corrector: null, correctionModel: "gpt-5.6-terra", correctionIssue: issue });
+    expect(await (await fetch(unavailable.base + "/api/health")).json()).toMatchObject({ correctionReady: false, correctionModel: "gpt-5.6-terra", correctionMessage: issue });
+  });
+
+  it("accepts correct as an output mode when creating a session", async () => {
+    const { base } = await start();
+    expect((await createSession(base, "correct")).outputMode).toBe("correct");
+  });
+
+  it("switches a transcribe session to correct, answers 202 and proofreads the stored utterances", async () => {
+    const { app, base, database, correct } = await start();
+    const session = await createSession(base, "transcribe");
+    addUtterance(database, session.id, 0, "Pi is a great coding agent.");
+    addUtterance(database, session.id, 1, "Pi again and again.");
+    database.setSessionStatus(session.id, "completed");
+
+    const response = await fetch(`${base}/api/sessions/${session.id}/correct`, json("POST", {}));
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ id: session.id, outputMode: "correct" });
+    await app.corrections.waitForIdle();
+    // Both utterances travel in one request.
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0]![0].items.map((item) => item.text)).toEqual(["Pi is a great coding agent.", "Pi again and again."]);
+    const snapshot = await (await fetch(`${base}/api/sessions/${session.id}`)).json() as { session: { outputMode: string }; transcript: Array<{ utterance: { text: string }; correction: { text: string; model: string } | null }> };
+    expect(snapshot.session.outputMode).toBe("correct");
+    expect(snapshot.transcript.map((entry) => [entry.utterance.text, entry.correction?.text])).toEqual([["Pi is a great coding agent.", "Pi (CLI) is a great coding agent."], ["Pi again and again.", "Pi (CLI) again and again."]]);
+    expect(snapshot.transcript[0]?.correction?.model).toBe("test-correction");
+  });
+
+  it("is idempotent: a second request neither fails nor proofreads again", async () => {
+    const { app, base, database, correct } = await start();
+    const session = await createSession(base, "correct");
+    addUtterance(database, session.id, 0, "Pi is great.");
+    database.setSessionStatus(session.id, "completed");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect((await fetch(`${base}/api/sessions/${session.id}/correct`, json("POST", {}))).status).toBe(202);
+      await app.corrections.waitForIdle();
+    }
+    expect(correct).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects translate sessions with 409, unknown sessions with 404 and a missing corrector with 503", async () => {
+    const { base, database, correct } = await start();
+    const translate = await createSession(base, "translate");
+    addUtterance(database, translate.id, 0, "Pi is great.");
+    expect((await fetch(`${base}/api/sessions/${translate.id}/correct`, json("POST", {}))).status).toBe(409);
+    expect(database.getSession(translate.id)?.outputMode).toBe("translate");
+    expect((await fetch(`${base}/api/sessions/00000000-0000-0000-0000-000000000000/correct`, json("POST", {}))).status).toBe(404);
+    expect(correct).not.toHaveBeenCalled();
+
+    const issue = "OpenAIの認証が未設定です。";
+    const unavailable = await start({ corrector: null, correctionIssue: issue });
+    const transcribe = await createSession(unavailable.base, "transcribe");
+    const response = await fetch(`${unavailable.base}/api/sessions/${transcribe.id}/correct`, json("POST", {}));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: issue });
+    expect(unavailable.database.getSession(transcribe.id)?.outputMode).toBe("transcribe");
+  });
+
+  it("resumes unfinished corrections of correct sessions when the application starts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "rt-http-"));
+    const database = new AppDatabase(join(directory, "test.sqlite"));
+    const session = database.createSession({ sourceKind: "file", sourceLanguage: "en", targetLanguage: "ja", outputMode: "correct" });
+    addUtterance(database, session.id, 0, "Pi is great.");
+    database.setSessionStatus(session.id, "completed");
+    const correct = vi.fn(async (input: CorrectionBatchInput) => ({ items: input.items.map((item) => ({ id: item.id, text: item.text.toUpperCase() })) }));
+    const app = createApplication({
+      database, audioRoot: join(directory, "audio"), webRoot: join(directory, "web"),
+      providers: {
+        recognizer: null, translator: null, translationAuthType: null, translationSelection: "openai", translationModel: "test", translationIssue: null,
+        corrector: { provider: "test", model: "test-correction", correctBatch: correct }, correctionModel: "test-correction", correctionIssue: null, contextGenerator: null,
+      },
+    });
+    running.push({ app, directory });
+    await app.corrections.waitForIdle();
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(database.getSnapshot(session.id)?.transcript[0]?.correction?.text).toBe("PI IS GREAT.");
+  });
+
+  it("does not send a partial batch for a session whose transcription is still running", async () => {
+    const { app, base, database, correct } = await start();
+    const session = await createSession(base, "correct");
+    addUtterance(database, session.id, 0, "Pi is great.");
+    expect((await fetch(`${base}/api/sessions/${session.id}/correct`, json("POST", {}))).status).toBe(202);
+    await app.corrections.waitForIdle();
+    expect(correct).not.toHaveBeenCalled();
+    database.setSessionStatus(session.id, "completed");
+    expect((await fetch(`${base}/api/sessions/${session.id}/correct`, json("POST", {}))).status).toBe(202);
+    await app.corrections.waitForIdle();
+    expect(correct).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts the proofreading request in flight when the application closes, without waiting for it", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "rt-http-"));
+    const database = new AppDatabase(join(directory, "test.sqlite"));
+    const session = database.createSession({ sourceKind: "file", sourceLanguage: "en", targetLanguage: "ja", outputMode: "correct" });
+    addUtterance(database, session.id, 0, "Pi is great.");
+    database.setSessionStatus(session.id, "completed");
+    let started!: () => void;
+    const requestStarted = new Promise<void>((resolve) => { started = resolve; });
+    let aborted = false;
+    const correctBatch = vi.fn((_input: CorrectionBatchInput, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      started();
+      signal.addEventListener("abort", () => { aborted = true; reject(new DOMException("aborted", "AbortError")); }, { once: true });
+    }));
+    const app = createApplication({
+      database, audioRoot: join(directory, "audio"), webRoot: join(directory, "web"),
+      providers: {
+        recognizer: null, translator: null, translationAuthType: null, translationSelection: "openai", translationModel: "test", translationIssue: null,
+        corrector: { provider: "test", model: "test-correction", correctBatch }, correctionModel: "test-correction", correctionIssue: null, contextGenerator: null,
+      },
+    });
+    try {
+      await requestStarted;
+      const startedAt = Date.now();
+      await app.close();
+      expect(aborted).toBe(true);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

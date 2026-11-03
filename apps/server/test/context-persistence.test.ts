@@ -33,4 +33,28 @@ describe("context schema migration and persistence", () => {
       expect(database.completeSessionIfDrained(session.id)).toBe(false);
     } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
   });
+
+  it("adds output_mode to old databases as translate and persists transcribe sessions across reopening", () => {
+    const directory = mkdtempSync(join(tmpdir(), "rt-migration-"));
+    const path = join(directory, "test.sqlite");
+    const old = new DatabaseSync(path);
+    old.exec(`CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, status TEXT NOT NULL, source_kind TEXT NOT NULL, source_language TEXT,
+      target_language TEXT NOT NULL, title TEXT, last_acked_seq INTEGER NOT NULL DEFAULT -1,
+      created_at TEXT NOT NULL, stopped_at TEXT
+    ); INSERT INTO sessions VALUES ('old', 'completed', 'microphone', 'en', 'ja', 'Existing', -1, '2025-01-01', '2025-01-01');`);
+    old.close();
+    let database = new AppDatabase(path);
+    try {
+      expect(database.getSession("old")?.outputMode).toBe("translate");
+      expect(database.createSession({ sourceKind: "file", targetLanguage: "ja" }).outputMode).toBe("translate");
+      const session = database.createSession({ sourceKind: "file", targetLanguage: "ja", outputMode: "transcribe" });
+      expect(session.outputMode).toBe("transcribe");
+      database.close();
+      database = new AppDatabase(path);
+      expect(database.getSession(session.id)?.outputMode).toBe("transcribe");
+      expect(database.getSnapshot(session.id)?.session.outputMode).toBe("transcribe");
+      expect(database.getSession("old")?.outputMode).toBe("translate");
+    } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
 });

@@ -9,7 +9,11 @@ export const DEFAULT_OPENCODE_MODEL = "glm-5.3-flash";
  * https://github.com/anomalyco/opencode/blob/dev/services/www/src/docs/content/console/go.mdx
  * No stored OpenAI credential or ambient API key is consulted here.
  */
-export function createOpenCodeGoTranslator(apiKey: string | undefined, modelId = DEFAULT_OPENCODE_MODEL): ModelTranslator | null {
+export function createOpenCodeGoTranslator(
+  apiKey: string | undefined,
+  modelId = DEFAULT_OPENCODE_MODEL,
+  modelVariable = "OPENCODE_TRANSLATE_MODEL",
+): ModelTranslator | null {
   const key = apiKey?.trim();
   if (!key) return null;
   const models = createModels({ authContext: {
@@ -18,7 +22,7 @@ export function createOpenCodeGoTranslator(apiKey: string | undefined, modelId =
   } });
   models.setProvider(opencodeGoProvider());
   const catalogModel = models.getModel("opencode-go", modelId);
-  if (!catalogModel) throw new Error("Unknown OPENCODE_TRANSLATE_MODEL. Choose an OpenCode Go model supported by the installed catalog.");
+  if (!catalogModel) throw new Error(`Unknown ${modelVariable}. Choose an OpenCode Go model supported by the installed catalog.`);
   const baseUrl = catalogModel.api === "anthropic-messages"
     ? "https://opencode.ai/inference/go/anthropic"
     : "https://opencode.ai/inference/go/openai/v1";

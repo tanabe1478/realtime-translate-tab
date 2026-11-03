@@ -22,6 +22,13 @@ export async function stopSession(id: string, lastSeq: number): Promise<SessionV
   });
 }
 
+/** Switches the session to AI proofreading and queues its uncorrected utterances (202). */
+export async function correctSession(id: string): Promise<SessionView> {
+  return request<SessionView>(`/api/sessions/${encodeURIComponent(id)}/correct`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+}
+
 function contextUrl(videoId: string, targetLanguage: string): string {
   return `/api/video-contexts/${encodeURIComponent(videoId)}?targetLanguage=${encodeURIComponent(targetLanguage)}`;
 }

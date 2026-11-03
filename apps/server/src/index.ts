@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { AppDatabase } from "./database.js";
 import { createApplication } from "./app.js";
 import { createProviders } from "./providers/index.js";
+import { parseCorrectionBatchSize } from "./services/correction-service.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 loadEnv({ path: resolve(repositoryRoot, ".env"), quiet: true });
@@ -14,12 +15,15 @@ const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
 const database = new AppDatabase(join(dataRoot, "realtime-translate.sqlite"));
 const providers = await createProviders(process.env, dataRoot);
-const application = createApplication({ database, providers, audioRoot: join(dataRoot, "audio"), webRoot });
+const application = createApplication({ database, providers, audioRoot: join(dataRoot, "audio"), webRoot,
+  correction: { batchSize: parseCorrectionBatchSize(process.env.CORRECTION_BATCH_SIZE) },
+});
 
 application.server.listen(port, host, () => {
   console.log(`\nRealtime Translate server: http://${host}:${port}`);
   console.log(`ASR: ${providers.recognizer ? `${providers.recognizer.provider}/${providers.recognizer.model}` : "disabled (audio storage only)"}`);
   console.log(`Translation: ${providers.translator ? `${providers.translator.provider}/${providers.translator.model}` : `${providers.translationSelection} disabled: ${providers.translationIssue}`}`);
+  console.log(`Correction: ${providers.corrector ? `${providers.corrector.provider}/${providers.corrector.model}` : `disabled: ${providers.correctionIssue}`}`);
   if (!existsSync(webRoot)) console.log("Web build not found; use `pnpm dev` for the Vite development server.");
 });
 
