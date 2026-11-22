@@ -31,6 +31,29 @@ Windows-firstのリアルタイム文字起こし・翻訳Webアプリです。C
 - `@earendil-works/pi-ai`のChatGPT OAuthによる翻訳
 - 25 MB以下の音声・動画ファイル入力
 
+## CLIでローカルファイルやYouTubeを文字起こしする
+
+初回、またはYouTube対応前にセットアップ済みの場合は `pnpm whisper:setup` を実行し、リポジトリのルートから次のように使います。
+
+```powershell
+pnpm transcribe "C:\path\to\video.mp4" --language ja
+pnpm transcribe "https://www.youtube.com/watch?v=VIDEO_ID" --language ja
+```
+
+文字起こしの本文を標準出力に出します。言語指定を省くと自動検出し、`--json` を付けると検出言語なども返します。ブラウザやHTTPサーバー、ChatGPTログインは不要です。初回はWhisperモデルをダウンロードする場合があります。
+
+CLIは動画・音声ファイルを直接開くため、Web/HTTP入力の25 MB制限は適用されません。ただし、長い音声ほどメモリと処理時間が必要です。YouTubeでは `yt-dlp` が動画1本分の音声を一時フォルダに取得し、処理後に削除します。プレイリストだけのURLには対応しません。視聴・ダウンロードが許可された動画を使ってください。YouTubeへの接続にはネットが必要ですが、文字起こし自体はローカルです。
+
+### 英語の文字起こし、補正、日本語の逐語寄りの翻訳をまとめて実行する
+
+```powershell
+pnpm transcribe:ja "https://www.youtube.com/watch?v=VIDEO_ID" --output data/transcripts/result.md
+```
+
+ローカルの音声・動画パスも渡せます。Whisperは英語で認識し、そのテキストだけをChatGPTへ送ります。フィラーや誤認識を文脈に沿って補正し、要約せず日本語に翻訳します。Markdownには補正済み英語と日本語訳を並べ、未補正の文字起こしも末尾に残します。`--output` を省くと標準出力に表示します。既存ファイルは上書きしません。
+
+ChatGPT未認証の場合は `pnpm auth:openai` を実行してください。補正が不要、または外部にテキストを送れない場合は `pnpm transcribe` を使います。
+
 ## 必要環境
 
 - Node.js 24（`node:sqlite`を使用）
@@ -98,7 +121,7 @@ pnpm dev
 4. **「タブの音声を共有」**を有効にする
 5. YouTubeを再生する
 
-許可なしの自動取得、YouTube URLからの直接ダウンロード、PC全体の音声取得は行いません。
+Webアプリは許可なしの自動取得、YouTube URLからの直接ダウンロード、PC全体の音声取得は行いません。URLを直接渡す場合は上記のCLIを使います。
 
 ## 認証の解除
 
