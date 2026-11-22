@@ -7,7 +7,9 @@ pnpm whisper:setup
 pnpm whisper:start
 ```
 
-初回起動時に`.env`の`WHISPER_MODEL`をHugging Faceからダウンロードします。
+初回起動時に`.env`の`WHISPER_MODEL`をHugging Faceからダウンロードします。`small`は数百MB程度です。
+
+Pythonは3.10〜3.12を使います。Ubuntu標準のPythonが3.14でも置き換えず、Whisper専用の仮想環境を作ります。セットアップは既存の`.venv-whisper`を再利用し、なければ`.env`の`WHISPER_PYTHON`（任意の絶対パス指定）、またはPython 3.12 / 3.11 / 3.10を探します。未対応のPythonで既存環境を上書きすることはありません。uvを使う手順はルートのREADMEを参照してください。
 
 推奨設定:
 

@@ -1,5 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { encodeWav } from "../src/audio-capture.js";
+import { encodeWav, getYouTubeCaptureOptions } from "../src/audio-capture.js";
+
+describe("YouTube tab capture", () => {
+  it("offers the current app tab without requesting system audio or suppressing playback", () => {
+    expect(getYouTubeCaptureOptions()).toEqual({
+      video: { displaySurface: "browser" },
+      audio: {
+        suppressLocalAudioPlayback: false,
+        restrictOwnAudio: false,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      preferCurrentTab: true,
+      selfBrowserSurface: "include",
+      surfaceSwitching: "exclude",
+      systemAudio: "exclude",
+    });
+  });
+});
 
 describe("encodeWav", () => {
   it("writes a valid mono PCM WAV header", async () => {

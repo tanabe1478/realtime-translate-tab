@@ -1,3 +1,19 @@
+import type { TranslationHints, VideoMetadata } from "@realtime-translate/contracts";
+
+export interface ContextGenerationInput {
+  /** Stable routing identity for repeated glossary refinements. */
+  videoId?: string;
+  targetLanguage: string;
+  metadata: VideoMetadata | null;
+  previous: TranslationHints;
+  /** Source transcripts only; no generated translations used as factual evidence. */
+  transcripts: readonly string[];
+}
+
+export interface ContextGenerator {
+  generateContext(input: ContextGenerationInput, signal: AbortSignal): Promise<TranslationHints>;
+}
+
 export interface AudioInput {
   bytes: Uint8Array;
   mimeType: string;
@@ -31,6 +47,7 @@ export interface TranslationInput {
   targetLanguage: string;
   /** Finalized preceding utterances. They are reference context, not translation input. */
   context: readonly TranslationContextEntry[];
+  hints?: TranslationHints | null;
 }
 
 export interface TranslationResult {

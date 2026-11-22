@@ -4,6 +4,8 @@ import { AppDatabase, type AssembledUtterance, type AudioSegmentRow } from "../d
 import type { SpeechRecognizer, Translator } from "../providers/index.js";
 import { EventHub } from "./event-hub.js";
 import { assembleUtterance, type UtteranceAssembly } from "./utterance-assembler.js";
+import { buildAsrPrompt } from "./context-hints.js";
+import type { VideoContextService } from "./video-context.js";
 
 export class ProcessingPipeline {
   private readonly sessionTails = new Map<string, Promise<void>>();
@@ -14,7 +16,13 @@ export class ProcessingPipeline {
     private readonly events: EventHub,
     private readonly recognizer: SpeechRecognizer | null,
     private readonly translator: Translator | null,
+    private readonly videoContexts?: Pick<VideoContextService, "onUtterance">,
+    private readonly translationUnavailableReason = "翻訳の認証が未設定です。選択中のプロバイダー設定を確認してサーバーを再起動してください。",
   ) {}
+
+  async waitForIdle(): Promise<void> {
+    await Promise.all(this.sessionTails.values());
+  }
 
   enqueue(segment: AudioSegmentRow): void {
     const key = `${segment.session_id}:${segment.seq}`;
@@ -89,7 +97,10 @@ export class ProcessingPipeline {
               mimeType: segment.mime_type,
               fileName: segment.file_name,
               sourceLanguage: session.sourceLanguage,
-              prompt: this.database.getRecentAsrPrompt(segment.session_id, segment.seq),
+              prompt: buildAsrPrompt(
+                this.database.getRecentAsrPrompt(segment.session_id, segment.seq),
+                this.database.getSessionVideoContext(segment.session_id)?.hints,
+              ),
             },
             AbortSignal.timeout(120_000),
           );
@@ -166,6 +177,7 @@ export class ProcessingPipeline {
     });
     this.database.setAudioRangeProcessingStatus(sessionId, assembly.startSeq, assembly.endSeq, "processing");
     this.publish({ type: "utterance.final", sessionId, seq: assembly.endSeq, utterance });
+    this.videoContexts?.onUtterance(sessionId, assembly.endSeq);
     return { utterance, startSeq: assembly.startSeq, endSeq: assembly.endSeq };
   }
 
@@ -178,7 +190,7 @@ export class ProcessingPipeline {
         sessionId: utterance.sessionId,
         seq: endSeq,
         stage: "translation",
-        reason: "ChatGPTへ未ログインです。`pnpm auth:openai`を実行してサーバーを再起動してください。",
+        reason: this.translationUnavailableReason,
       });
       return;
     }
@@ -191,6 +203,7 @@ export class ProcessingPipeline {
           sourceLanguage: utterance.language,
           targetLanguage,
           context: this.database.getTranslationContext(utterance.sessionId, startSeq, targetLanguage),
+          hints: this.database.getSessionVideoContext(utterance.sessionId)?.hints ?? null,
         },
         AbortSignal.timeout(120_000),
       );

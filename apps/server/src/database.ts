@@ -11,6 +11,7 @@ import type {
   TranscriptEntry,
   TranslationView,
   UtteranceView,
+  VideoContextView,
 } from "@realtime-translate/contracts";
 
 interface SessionRow {
@@ -20,6 +21,8 @@ interface SessionRow {
   source_language: string | null;
   target_language: string;
   title: string | null;
+  video_id: string | null;
+  context_through_seq: number;
   last_acked_seq: number;
   created_at: string;
   stopped_at: string | null;
@@ -161,10 +164,23 @@ export class AppDatabase {
         UNIQUE (utterance_id, target_language)
       );
 
+      CREATE TABLE IF NOT EXISTS video_contexts (
+        video_id TEXT NOT NULL,
+        target_language TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        value_json TEXT NOT NULL,
+        PRIMARY KEY (video_id, target_language)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_audio_processing ON audio_segments(processing_status, session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_utterances_session ON utterances(session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_fragments_session ON asr_fragments(session_id, seq);
     `);
+
+    const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as unknown as Array<{ name: string }>;
+    if (!sessionColumns.some((column) => column.name === "video_id")) this.db.exec("ALTER TABLE sessions ADD COLUMN video_id TEXT");
+    if (!sessionColumns.some((column) => column.name === "context_through_seq")) this.db.exec("ALTER TABLE sessions ADD COLUMN context_through_seq INTEGER NOT NULL DEFAULT -1");
+    if (!sessionColumns.some((column) => column.name === "expected_last_seq")) this.db.exec("ALTER TABLE sessions ADD COLUMN expected_last_seq INTEGER");
 
     const utteranceColumns = this.db.prepare("PRAGMA table_info(utterances)").all() as unknown as Array<{ name: string }>;
     if (!utteranceColumns.some((column) => column.name === "start_seq")) {
@@ -184,14 +200,16 @@ export class AppDatabase {
       sourceLanguage: input.sourceLanguage ?? null,
       targetLanguage: input.targetLanguage,
       title: input.title ?? null,
+      videoId: input.videoId ?? null,
       lastAckedSeq: -1,
       createdAt: new Date().toISOString(),
       stoppedAt: null,
     };
     this.db.prepare(`
-      INSERT INTO sessions (id, status, source_kind, source_language, target_language, title, last_acked_seq, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(session.id, session.status, session.sourceKind, session.sourceLanguage, session.targetLanguage, session.title, session.lastAckedSeq, session.createdAt);
+      INSERT INTO sessions (id, status, source_kind, source_language, target_language, title, video_id, last_acked_seq, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(session.id, session.status, session.sourceKind, session.sourceLanguage, session.targetLanguage, session.title, session.videoId, session.lastAckedSeq, session.createdAt);
+    if (session.videoId) this.ensureVideoContext(session.videoId, session.targetLanguage);
     return session;
   }
 
@@ -209,12 +227,58 @@ export class AppDatabase {
       const translation = translationStatement.get(row.id, session.targetLanguage) as unknown as TranslationRow | undefined;
       return { utterance: mapUtterance(row), translation: translation ? mapTranslation(translation) : null };
     });
-    return { session, transcript };
+    return { session, transcript, videoContext: session.videoId ? this.getVideoContext(session.videoId, session.targetLanguage) : null };
   }
 
-  stopSession(id: string): SessionView | null {
+  ensureVideoContext(videoId: string, targetLanguage: string): VideoContextView {
+    const initial: VideoContextView = {
+      videoId, targetLanguage, metadata: null, hints: { topic: "", glossary: [] },
+      mode: "auto", status: "idle", basis: "metadata", message: null,
+      version: 0, updatedAt: new Date().toISOString(),
+    };
+    this.db.prepare("INSERT OR IGNORE INTO video_contexts (video_id, target_language, version, value_json) VALUES (?, ?, 0, ?)")
+      .run(videoId, targetLanguage, JSON.stringify(initial));
+    return this.getVideoContext(videoId, targetLanguage)!;
+  }
+
+  getVideoContext(videoId: string, targetLanguage: string): VideoContextView | null {
+    const row = this.db.prepare("SELECT value_json FROM video_contexts WHERE video_id = ? AND target_language = ?")
+      .get(videoId, targetLanguage) as { value_json: string } | undefined;
+    return row ? JSON.parse(row.value_json) as VideoContextView : null;
+  }
+
+  /** Compare-and-swap: a slow model response must never overwrite a user's edit. */
+  saveVideoContext(value: VideoContextView, expectedVersion: number): VideoContextView | null {
+    const next = { ...value, version: expectedVersion + 1, updatedAt: new Date().toISOString() };
+    const result = this.db.prepare("UPDATE video_contexts SET version = ?, value_json = ? WHERE video_id = ? AND target_language = ? AND version = ?")
+      .run(next.version, JSON.stringify(next), value.videoId, value.targetLanguage, expectedVersion);
+    return result.changes === 1 ? next : null;
+  }
+
+  getSessionVideoContext(sessionId: string): VideoContextView | null {
+    const session = this.getSession(sessionId);
+    return session?.videoId ? this.getVideoContext(session.videoId, session.targetLanguage) : null;
+  }
+
+  getContextAnalysisSeq(sessionId: string): number {
+    const row = this.db.prepare("SELECT context_through_seq FROM sessions WHERE id = ?").get(sessionId) as { context_through_seq: number } | undefined;
+    return row?.context_through_seq ?? -1;
+  }
+
+  markContextAnalysis(sessionId: string, throughSeq: number): void {
+    this.db.prepare("UPDATE sessions SET context_through_seq = ? WHERE id = ?").run(throughSeq, sessionId);
+  }
+
+  getContextTranscripts(sessionId: string, throughSeq: number): string[] {
+    const rows = this.db.prepare("SELECT text FROM utterances WHERE session_id = ? AND seq <= ? ORDER BY seq DESC LIMIT 8")
+      .all(sessionId, throughSeq) as unknown as Array<{ text: string }>;
+    return rows.reverse().map((row) => row.text.slice(0, 1_000));
+  }
+
+  stopSession(id: string, expectedLastSeq?: number): SessionView | null {
     const stoppedAt = new Date().toISOString();
-    this.db.prepare("UPDATE sessions SET status = 'processing', stopped_at = ? WHERE id = ?").run(stoppedAt, id);
+    this.db.prepare("UPDATE sessions SET status = 'processing', stopped_at = ?, expected_last_seq = ? WHERE id = ?")
+      .run(stoppedAt, expectedLastSeq ?? this.getSession(id)?.lastAckedSeq ?? -1, id);
     return this.getSession(id);
   }
 
@@ -224,7 +288,9 @@ export class AppDatabase {
 
   completeSessionIfDrained(id: string): boolean {
     const session = this.getSession(id);
-    if (!session?.stoppedAt) return false;
+    if (!session?.stoppedAt || session.status === "completed") return false;
+    const expected = this.db.prepare("SELECT expected_last_seq FROM sessions WHERE id = ?").get(id) as { expected_last_seq: number | null };
+    if (expected.expected_last_seq !== null && session.lastAckedSeq < expected.expected_last_seq) return false;
     const row = this.db.prepare("SELECT COUNT(*) AS pending FROM audio_segments WHERE session_id = ? AND processing_status != 'completed'").get(id) as unknown as { pending: number };
     if (row.pending > 0) return false;
     this.setSessionStatus(id, "completed");
@@ -403,6 +469,7 @@ function mapSession(row: SessionRow): SessionView {
     sourceLanguage: row.source_language,
     targetLanguage: row.target_language,
     title: row.title,
+    videoId: row.video_id,
     lastAckedSeq: row.last_acked_seq,
     createdAt: row.created_at,
     stoppedAt: row.stopped_at,
