@@ -8,17 +8,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from faster_whisper import WhisperModel
 import uvicorn
 
-ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(ROOT / ".env")
+from recognition import COMPUTE_TYPE, DEVICE, MODEL_NAME, load_model, run_transcription
 
-MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
-DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 HOST = os.getenv("WHISPER_HOST", "127.0.0.1")
 PORT = int(os.getenv("WHISPER_PORT", "8790"))
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -31,14 +26,7 @@ model_lock = asyncio.Lock()
 async def lifespan(_: FastAPI):
     global model
     print(f"Loading faster-whisper model={MODEL_NAME} device={DEVICE} compute_type={COMPUTE_TYPE}")
-    model = await asyncio.to_thread(
-        WhisperModel,
-        MODEL_NAME,
-        device=DEVICE,
-        compute_type=COMPUTE_TYPE,
-        cpu_threads=max(1, int(os.getenv("WHISPER_CPU_THREADS", "4"))),
-        num_workers=1,
-    )
+    model = await asyncio.to_thread(load_model)
     print("Local Whisper is ready")
     yield
     model = None
@@ -81,33 +69,11 @@ async def transcribe(request: Request) -> dict[str, Any]:
             temporary.write(audio)
             path = temporary.name
         async with model_lock:
-            result = await asyncio.to_thread(run_transcription, path, language, initial_prompt)
+            result = await asyncio.to_thread(run_transcription, model, path, language, initial_prompt)
         return result
     finally:
         if path:
             Path(path).unlink(missing_ok=True)
-
-
-def run_transcription(path: str, language: str | None, initial_prompt: str | None) -> dict[str, Any]:
-    assert model is not None
-    segments, info = model.transcribe(
-        path,
-        language=language,
-        initial_prompt=initial_prompt,
-        beam_size=1,
-        best_of=1,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        word_timestamps=False,
-    )
-    text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
-    return {
-        "text": text,
-        "language": info.language,
-        "languageProbability": info.language_probability,
-        "duration": info.duration,
-        "model": MODEL_NAME,
-    }
 
 
 def safe_suffix(file_name: str, content_type: str) -> str:

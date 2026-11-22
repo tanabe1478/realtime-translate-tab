@@ -16,6 +16,7 @@ data/auth.json
 data/auth.json.lock
 data/device-id
 data/audio/*
+data/transcripts/
 !data/audio/.gitkeep
 
 # Local reference repository; not part of this application.

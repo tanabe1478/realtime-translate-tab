@@ -17,21 +17,27 @@ if (action === "setup") {
   if (!existsSync(venvPython)) run(python.command, [...python.args, "-m", "venv", venv]);
   run(venvPython, ["-m", "pip", "install", "--upgrade", "pip"]);
   run(venvPython, ["-m", "pip", "install", "-r", join(root, "services", "whisper", "requirements.txt")]);
-  console.log("\nWhisper setup completed. The model downloads on the first `pnpm whisper:start`.");
-} else if (action === "start") {
+  console.log("\nWhisper setup completed. The model downloads on first use.");
+} else if (action === "start" || action === "transcribe") {
   if (!existsSync(venvPython)) {
     console.error("Local Whisper is not installed. Run `pnpm whisper:setup` first.");
     process.exit(1);
   }
-  const child = spawn(venvPython, [join(root, "services", "whisper", "server.py")], {
-    cwd: root,
+  const isTranscription = action === "transcribe";
+  const entry = join(root, "services", "whisper", isTranscription ? "transcribe.py" : "server.py");
+  const child = spawn(venvPython, [entry, ...process.argv.slice(3)], {
+    cwd: isTranscription ? process.cwd() : root,
     env: process.env,
     stdio: "inherit",
   });
   for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => child.kill(signal));
+  child.on("error", (error) => {
+    console.error(`Could not start Python: ${error.message}`);
+    process.exitCode = 1;
+  });
   child.on("exit", (code, signal) => process.exitCode = signal ? 1 : (code ?? 1));
 } else {
-  console.error("Usage: node scripts/whisper.mjs <setup|start>");
+  console.error("Usage: node scripts/whisper.mjs <setup|start|transcribe>");
   process.exit(1);
 }
 

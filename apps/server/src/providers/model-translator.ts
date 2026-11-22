@@ -71,14 +71,14 @@ export class ModelTranslator implements Translator, ContextGenerator {
     return { text };
   }
 
-  private async complete(context: Context, signal: AbortSignal, sessionId: string, maxTokens?: number) {
+  protected async complete(context: Context, signal: AbortSignal, sessionId?: string, maxTokens?: number) {
     try {
       const response = await this.models.completeSimple(this.modelDefinition, context, {
         reasoning: "low",
         ...(maxTokens === undefined ? {} : { maxTokens }),
         maxRetries: 0,
         signal,
-        sessionId,
+        ...(sessionId === undefined ? {} : { sessionId }),
         // Identify this application honestly; never impersonate a coding agent.
         ...(this.provider === "opencode-go" ? { headers: { "User-Agent": "realtime-translate-tab/0.1.0" } } : {}),
       });
@@ -96,6 +96,9 @@ export class ModelTranslator implements Translator, ContextGenerator {
   private safeError(raw: string, signal: AbortSignal): TranslationProviderError {
     const label = this.provider === "opencode-go" ? "OpenCode Go" : "OpenAI";
     if (signal.aborted) return new TranslationProviderError(`${label}へのリクエストが中断またはタイムアウトしました。`);
+    if (/\binvalid_grant\b/i.test(raw) && this.provider === "chatgpt-subscription") {
+      return new TranslationProviderError("ChatGPT OAuth could not be renewed. Run `pnpm auth:openai` and retry.");
+    }
     if (/\b401\b|unauthorized|invalid.api.key/i.test(raw)) {
       return new TranslationProviderError(`${label}の認証に失敗しました。選択中の認証設定を確認してください。別の接続先には切り替えません。`);
     }
